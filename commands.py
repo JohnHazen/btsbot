@@ -1,0 +1,1321 @@
+import log
+
+from slack_sdk.errors import SlackApiError
+
+from utility import select_quals,slack_user_id_from_context,command_words_from_context,authorized
+from utility import slack_ts_from_context,user_from_slack_id,qual_strength,normalize_slack_id
+import utility
+
+import functools
+import json
+import datetime
+
+from data_models import users,parts,songparts,songs,tags,quals
+from data_models import songs_by_id, parts_by_id, users_by_id, slack_name_from_db_name
+from data_models import slack_id_from_slack_name, user_id_from_slack_id,slack_id_from_user_id
+from data_models import create_qual, delete_qual, create_user, reorder_tags, delete_tag, tag_from_id
+from data_models import create_song
+from data_models import QualExpirationData
+
+
+#TODO maybe use decorator to automatically register Commands and SubCommands?
+
+# use _commands dict to track what commands have what "path"s
+
+class Command():
+    '''
+    Command is a bot command.  Commands can have SubCommands, and each command word may have one or more synonyms
+    We'll us the tree of commands/sub-commands to parse each command message.  If mapping from message to command
+    is certain, we'll just execute it.  If not, user will be prompted for additional clarity.
+    '''
+
+    def __init__(self,func,path,auths):
+        self.func = func
+        self.path = path
+        self.auths = auths
+        self.help_line = func.__doc__.split("\n")[0]
+        self.full_help = func.__doc__
+        self.subcommands = {}
+
+    def add_subcommand(self,cmd):
+        # basic for now.  will want to figure out synonyms
+        self.subcommands[cmd.path] = cmd
+
+    @log.logger.catch
+    def run(self,arguments,context,client,**kwargs):
+        # probably need args
+        if not self.func:
+            log.slack.error(f"command object {self.path} called with no function")
+            return None
+        user = slack_user_id_from_context(context)
+        if not self.auths or any([authorized(user,x) for x in self.auths]):
+            return self.func(arguments,context,client,**kwargs)
+        user_name = users_by_id[user_id_from_slack_id[user]].name
+        log.slack.warning(f"command {self.path} called by {user_name} without auth.  (Needs one of {self.auths})")
+        return None
+
+    def __eq__(self,other):
+        return self.func == other.func
+
+
+_root_command = {}
+all_auths = set()
+
+# decorator for command functions
+def command(path,auths):
+    #@functools.wraps(f)
+    for auth in auths:
+        all_auths.add(auth)
+
+    def inner_decorator(f):
+        path_list = path.split()
+        root = _root_command
+        while len(path_list) > 1:
+            path_level = path_list.pop(0)
+            root = root[path_level].subcommands
+        cmd = Command(f,path,auths)
+        root[path_list[0]] = cmd
+        return f
+    return inner_decorator
+
+
+def iter_commands(user=None,command_words=[],root=_root_command,path=[]):
+    '''
+        iterate through commands/subcommands that a user has authorization to execute
+        if user is given, limit commands to those authorized for the user
+        if command_words is given, limit commands that fit the command words
+    '''
+    for key in sorted(root.keys()):
+        cmd = root[key]
+        yield from iter_commands(user=user,command_words=command_words,root=cmd.subcommands,path=path)
+        yield cmd
+
+
+@log.logger.catch
+def handle_submit(context,client,say=None,respond=None):
+    # dispatch_table maps the callback_id to a submit func and a redraw (for the parent) func
+    dispatch_table = {
+            'manage_song_edit': (manage_song_edit_submit,update_manage_songs),
+            'admin_user_edit': (admin_user_edit_submit,None),
+        }
+    if context['type'] != 'view_submission':
+        log.slack.error(f"handle_submit called for non-form-submission.\n{context}")
+        return False
+    callback_id = context['view']['callback_id']
+    if callback_id not in dispatch_table:
+        log.slack.error(f"handle_submit called for unknown callback_id: {callback_id}")
+        return False
+    # do common things here for all submits
+    parent_view_id = context['view']['external_id']
+    private_metadata = context['view']['private_metadata']
+    if private_metadata:
+        metadata = json.loads(context['view']["private_metadata"])
+        channel_say = functools.partial(say,channel=metadata['channel_id'],thread_ts=metadata['thread_ts'])
+    else:
+        log.debug(f"handle_submit: private_metadata not specified.")
+        channel_say = say
+    # now dispatch via callback_id
+    submit_func,redraw_func = dispatch_table[callback_id]
+    should_redraw = submit_func(context,client,say=channel_say,respond=respond)
+    if redraw_func is not None:
+        if should_redraw is None:
+            log.warning("submit_func for {callback_id} returned None.  Return True/False to indicate parent window redraw")
+        if should_redraw:
+            redraw_func(context,client,view_id=parent_view_id)
+
+@log.logger.catch
+def dispatch(context,client,say=None,respond=None):
+    '''
+    look through commands from _root_command and execute if sure, or ask for clarification
+    '''
+    command_words = command_words_from_context(context)
+    user = slack_user_id_from_context(context)
+    log.debug(f"dispatch_command: user: {user} Command_words{command_words}")
+    if command_words:
+        root = _root_command
+        cmd = None
+        while len(command_words) > 0:
+            token = command_words.pop(0)
+            token_lower = token.lower()
+            if token_lower in root:
+                cmd = root[token_lower]
+                root = cmd.subcommands
+            else:
+                # didn't match the next word, so pass that on as args
+                command_words.insert(0,token)
+                break
+        if cmd:
+            return cmd.run(command_words,context,client,say=say,respond=respond)
+        preamble = "Command not recognized.  Here are the commands you can run:"
+    else:
+        preamble = "Here are the commands you can run:"
+
+    # if haven't dispatched to a command, print help info
+    return _root_command['help'].run(command_words,context,client,say=say,respond=respond,help_preamble=preamble)
+
+def output_list_buttons(say, options, preamble=None, context=None):
+    '''
+    options is a list, each item a tuple of expanatory text, a button label, and a button value
+        button label and value are optional.  (If button not specified, there is no button.  If value
+        is not specified, the value is the same as the label.)
+    output a response listing the options, with buttons and an optional preamble explanation
+    '''
+    if context:
+        ts = slack_ts_from_context(context)
+    else:
+        ts = None
+    lines = []
+    blocks = []
+    if preamble:
+        lines.append(preamble)
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": preamble},
+            })
+
+    for line_parts in options:
+        text = line_parts.pop(0)
+        if text == '':
+            text = ' '
+        if line_parts:
+            button_label = line_parts.pop(0)
+        else:
+            button_label = None
+        if line_parts:
+            button_value = line_parts.pop(0)
+        else:
+            button_value = None
+        lines.append(f"{text}   '{button_label}' '{button_value}'")
+        block = {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": text},
+            }
+        if button_label:
+            block['accessory'] = {
+                "type": "button",
+                "text": {"type": "plain_text", "text": button_label},
+                "action_id": "output-list-button"
+                }
+        if button_value:
+            block['accessory']["value"] = button_value
+        blocks.append(block)
+    lines_text = "\n".join(lines)
+    try:
+        if ts is not None:
+            say(text=lines_text,blocks=blocks,thread_ts=ts)
+        else:
+            say(text=lines_text,blocks=blocks)
+    except:
+        log.error(f"error saying from output_list_buttons:\nblocks={blocks}\ntext={text}")
+
+def command_error(error_msg,context,client,say=None,respond=None):
+    user = slack_user_id_from_context(context)
+    log.slack.error(f"User {user} getting error: {error_msg}")
+    output_list_buttons(say,[],error_msg,context=context)
+
+
+@command("help",[])
+def bot_help(arguments,context,client,say=None,respond=None,help_preamble=""):
+    ''' Print bot help
+        extra doc string info here
+    '''
+    user = slack_user_id_from_context(context)
+    lines = []
+    for cmd in iter_commands():
+        if not cmd.auths or any([authorized(user,x) for x in cmd.auths]):
+            if cmd.help_line == '__no_help__':
+                continue
+            lines.append([f"{cmd.help_line}",cmd.path])
+        else:
+            pass
+    output_list_buttons(say,lines,help_preamble,context=context)
+
+#@command("auth",["auth_fail"])
+def auth_test(arguments,context,client,say=None,respond=None):
+    ''' Test bot dispatch
+        extra doc string info here
+    '''
+    log.debug(f"auth_test invoked")
+
+@command("singer",['music_team'])
+def singer_info(arguments,context,client,say=None,respond=None):
+    ''' show PRE info for another user
+        extra doc string info here
+    '''
+    user_id = user_from_slack_id(arguments[0])
+    if user_id:
+        user = users_by_id[user_id]
+        pre_self([],context,client,say=say,respond=respond,singer=user)
+    else:
+        output_list_buttons(say,[],f"Unable to find singer {arguments[0]}",context=context)
+
+@command("pre",[])
+def pre_self(arguments,context,client,say=None,respond=None,singer=None):
+    ''' show your own PRE info
+        extra doc string info here
+    '''
+    '''
+    Here is code for coloring elements (to use for expiration)
+
+    {
+      "blocks": [
+        {
+          "type": "rich_text",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "This is normal text, but the next part will be "
+                },
+                {
+                  "type": "color",
+                  "value": "#F405B3",
+                  "style": {
+                    "bold": True
+                  },
+                  "elements": [
+                    {
+                      "type": "text",
+                      "text": "custom colored text!"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+
+    '''
+    slack_id = slack_user_id_from_context(context)
+    user_id = user_from_slack_id(slack_id)
+    user = users_by_id[user_id]
+    if singer is not None:
+        user = singer
+        slack_id = slack_id_from_user_id(user.id)
+    lines = []
+    qual_songs = {}
+    for qual in select_quals(quals,user_ids=[user.id],only_most_recent=True):
+        if qual.song_id in qual_songs:
+            qual_song = qual_songs[qual.song_id]
+        else:
+            qual_song = {}
+            qual_songs[qual.song_id] = qual_song
+        part = parts_by_id[qual.part_id]
+        qual_song[part.name] = QualExpirationData(qual)
+    for song_id in qual_songs:
+        part_data = " ".join([f"{exp.emoji}{part}" for part,exp in qual_songs[song_id].items()])
+        details = f"pre details {slack_id} {song_id}"
+        lines.append([f"{songs_by_id[song_id].name}: {part_data}","details",details])
+    output_list_buttons(say,lines,f"The following songs are qualified for {user.name}",context=context)
+
+@command("pre delete",['music_team'])
+def pre_delete(arguments,context,client,say=None,respond=None,singer=None):
+    '''__no_help__
+       delete PRE qual record for a specific qual_id
+    '''
+    user_slack_id = slack_user_id_from_context(context)
+    slack_id,escaped_slack_id = normalize_slack_id(user_slack_id)
+    if not authorized(user_slack_id,'music_team'):
+        msg = f"'pre delete' operation requires music_team authorization."
+        return command_error(msg,context,client,say,respond)
+    log.debug(f"pre delete called with {arguments}, singer={singer}") 
+    if len(arguments) != 1:
+        msg = f"'pre delete' operation requires one arg: <qual_id>.  got {arguments}"
+        return command_error(msg,context,client,say,respond)
+
+    # gather info for logging delete request
+    qual_id = int(arguments[0])
+    qual = [q for q in quals if q.id==qual_id][0]
+    song = songs_by_id[qual.song_id]
+    user = users_by_id[qual.user_id]
+    part = parts_by_id[qual.part_id]
+    log.music_team.info(f"User {escaped_slack_id} deleting qual record {qual.id} ({user.name} {part.name} {song.name} {qual.date_time.strftime('%m/%d/%y')})")
+    delete_qual(qual)
+
+@command("pre details",[])
+def pre_details(arguments,context,client,say=None,respond=None,singer=None):
+    ''' show PRE info for a specific user and song
+        extra doc string info here
+    '''
+    log.debug(f"pre details called with {arguments}, singer={singer}") 
+    if len(arguments) != 2:
+        return command_error(f"'pre details' requires two args, <slack_user> and <song_id>",context,client,say,respond)
+    singer_slack_id,song_id = arguments
+    song_id = int(song_id)
+    user_slack_id = slack_user_id_from_context(context)
+    if singer_slack_id != user_slack_id:
+        # getting someone else's info, so need 'music_team' auth
+        if not authorized(user_slack_id,'music_team'):
+            return command_error(f"'pre details' for another user requires music_team authorization.",context,client,say,respond)
+    singer_id = user_from_slack_id(singer_slack_id)
+    if singer is None:
+        singer = users_by_id[singer_id]
+    else:
+        singer_slack_id = slack_id_from_user_id(singer.id)
+    lines = []
+    qual_list = []
+    exp_list = []
+    for qual in select_quals(quals,user_ids=[singer_id],song_id=song_id,only_most_recent=False):
+        exp_list.append(QualExpirationData(qual))
+    for exp in sorted(exp_list,reverse=True):
+        delete = f"pre delete {exp.qual.id}"
+        lines.append([f"{exp.qual.date_time.strftime('%m/%d/%y')} {parts_by_id[exp.qual.part_id].name} {exp.emoji} {exp.status}","delete",delete])
+    output_list_buttons(say,lines,f"Quals for {singer.name} for {songs_by_id[song_id].name}",context=context)
+
+@command("gig",[])
+def gig_songs(arguments,context,client,say=None,respond=None):
+    ''' "gig @singer @singer ..."  show which songs can be performed by the performers
+        You can specify more than four singers.
+    '''
+    lines = []
+    acceptable_song_strength = -1
+    verbose = False
+    ids = []
+    for arg in arguments:
+        if arg.lower() == 'verbose':
+            verbose = True
+            acceptable_song_strength = -2
+        else:
+            id = user_from_slack_id(arg)
+            if id is not None:
+                ids.append(id)
+
+    #ids = [user_from_slack_id(x) for x in arguments]
+    id_quals = select_quals(quals,user_ids=ids,only_most_recent=True)
+    display_non_performable = True
+    #hack for getting proper order for parts
+    parts = ["Tenor","Lead","Bari","Bass"]
+
+    if len(ids) > 0:
+        sorted_songs = sorted([(utility.qual_strength(id_quals,s),s) for s in songs],reverse=True)
+        performable = True
+        for ((qual_strength,missing_parts),song) in sorted_songs:
+            if performable and qual_strength < 1:
+                if not display_non_performable:
+                    break
+                # insert separator to show songs above are performable and songs below not
+                lines.append("\n\n ------ Non-performable ------\n\n")
+                performable = False
+            if qual_strength < acceptable_song_strength:
+                break
+            qual_strs = []
+            if verbose:
+                song_quals = select_quals(id_quals,song_id=song.id,only_most_recent=True)
+                for part_name in parts:
+                    part = [p for p in song.parts if p.part.name == part_name][0]
+                    part_quals = select_quals(song_quals, part_id=part.part_id)
+                    if len(ids) > 0:
+                        names = set([users_by_id[q.user_id].name for q in part_quals])
+                        if len(names) >0:
+                            names_str = '/'.join(names)
+                        else:
+                            names_str = 'None'
+                        qual_strs.append(f"{part.part.name}: {names_str}")
+                    else:
+                        qual_strs.append(f"{part.part.name}: {len(part_quals)}")
+            if not performable:
+                qual_strs.append(f"{missing_parts}")
+            qual_str = " / ".join(qual_strs)
+            lines.append(f"{song.name}  {qual_str}")
+
+
+    output_list_buttons(say,[[x,''] for x in lines],f"gig songs for {arguments}:",context=context)
+
+@command("admin",['admin'])
+def admin(arguments,context,client,say=None,respond=None):
+    '''__no_help__
+        misc admin actions.  Not used yet.
+    '''
+    pass
+
+@command("admin user",['admin'])
+def admin_user(arguments,context,client,say=None,respond=None):
+    ''' manage slack and database users
+    '''
+    log.debug(f"admin user called with {arguments}") 
+    if len(arguments) < 1:
+        return command_error(f"'admin user' requires one arg: <slack_user>",context,client,say,respond)
+    if arguments[0] in ["add","edit"]:
+        subcommand = arguments[0]
+        if len(arguments) < 2:
+            return command_error(f"'admin user (add|edit)' also requires <slack_user>",context,client,say,respond)
+        slack_display_id = arguments[1]
+    else:
+        slack_display_id = arguments[0]
+        subcommand = None
+    slack_user_id,escaped_slack_id = normalize_slack_id(slack_display_id)
+    user_id = user_from_slack_id(slack_user_id)
+    if user_id is None:
+        msg = f"{slack_display_id} is not in the database.  Click this button to add them, then edit."
+        next_subcommand = "add"
+    else:
+        msg = f"Slack requires you to press this button to access the user edit screen."
+        next_subcommand = "edit"
+    if subcommand == "add" and user_id is None:
+        #need to get name
+        try:
+            response = client.users_profile_get(user=slack_user_id)
+            name = response["profile"]["real_name"]
+        except SlackApiError as e:
+            log.slack.error(f"Error fetching user profile: {e.response['error']}")
+            return command_error(f"Error getting real name of user {slack_display_id}!  Please let an admin know.",
+                    context,client,say,respond)
+        #do add operation (call datamodels func)
+        create_user(name,slack_user_id)
+        msg = f"{slack_display_id} added to the database.  Click this button to edit."
+        user_id = user_from_slack_id(slack_user_id)
+        if user_id is None:
+            return command_error(f"Adding user {slack_display_id} failed!  Please let an admin know.",
+                    context,client,say,respond)
+        # add done, so now we want to edit
+        subcommand = "edit"
+
+    if "trigger_id" not in context:
+        if subcommand is None:
+            subcommand = next_subcommand
+        # output button so we have a trigger, which is required by slack to do modals
+        output_list_buttons(say,
+                [[msg,f"admin user {subcommand} {slack_user_id}"]],
+                None,
+                context=context)
+        return
+
+    user = users_by_id[user_id]
+
+    # now we have everything to open edit screen
+    client.views_open(
+        # Pass a valid trigger_id within 3 seconds of receiving it
+        trigger_id=context["trigger_id"],
+        view_id="admin_user_edit",
+        # View payload
+        view={
+            "type": "modal",
+            # View identifier
+            "callback_id": "admin_user_edit",
+            "title": {"type": "plain_text", "text": f"Edit User id {user.id}"},
+            "submit": {"type": "plain_text", "text": "Submit"},
+            #"private_metadata": json.dumps(private_metadata),
+            "blocks": [{
+                    "type": "input",
+                    "block_id": "user_name",
+                    "element": {
+                        "type": "plain_text_input",
+                        "initial_value": f"{user.name}",
+                        "action_id": "rename_user-action"
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Name",
+                        "emoji": True
+                    },
+                    "optional": False
+                },
+                auth_checkboxes_block(user.auths.split(',')),
+            ]
+        }
+    )
+
+@command("users",['admin'])
+def map_users(arguments,context,client,say=None,respond=None):
+    ''' map users from slack (requires rate limited API call)
+    '''
+    users_to_skip = ['slackbot','caguayo']
+    slack_users = client.users_list()['members']
+    for user in slack_users:
+        if user['deleted'] or user['is_bot'] or user['name'] in users_to_skip:
+            continue
+        slack_id_from_slack_name[user['profile']['real_name']] = user['id']
+    unused_slack_names = [x for x in slack_id_from_slack_name.keys()]
+    lines = []
+    for user in users:
+        if user.name in slack_id_from_slack_name:
+            slack_id = slack_id_from_slack_name[user.name]
+            user_id_from_slack_id[slack_id] = user.id
+            user.set_slack_id(slack_id)
+            unused_slack_names.remove(user.name)
+        elif ( user.name in slack_name_from_db_name and 
+               slack_name_from_db_name[user.name] in slack_id_from_slack_name ):
+            user_name = slack_name_from_db_name[user.name]
+            slack_id = slack_id_from_slack_name[user_name]
+            user_id_from_slack_id[slack_id] = user.id
+            user.set_slack_id(slack_id)
+            unused_slack_names.remove(user_name)
+        else:
+            slack_id = None
+        lines.append([f"{user.name}  {user.id}  {slack_id}",""])
+    lines.append([f"unmapped slack users: {unused_slack_names}",""])
+    log.slack.info(lines)
+
+@command("pre pass",['evaluator'])
+def pre_pass(arguments,context,client,say=None,respond=None):
+    ''' record a PRE pass for a Singer
+        expected args: part user song
+    '''
+    def pre_help():
+        output_list_buttons(say,
+                [[f"re-enter command or press button to do interactively:","pre interact"]],
+                f"Pre Pass command needs arguments <user> <part> <song title words>",
+                context=context)
+    requester_slack_id = slack_user_id_from_context(context)
+    requester_slack_id,escaped_requester_slack_id = normalize_slack_id(requester_slack_id)
+    #special precessing for submit from "pre interact"
+    args = list(arguments)
+    if args and args[0] == '_pre_interact_submit':
+        _x,slack_user_id,part,song_id,text_date,channel_id,ts = args
+        user = users_by_id[user_from_slack_id(slack_user_id)]
+        song = songs_by_id[song_id]
+        date = datetime.datetime.strptime(text_date,"%Y-%m-%d")
+        qual = create_qual(user,song,part,date)
+        channel_say = functools.partial(say,channel=channel_id,thread_ts=ts)
+        #TODO: do some notification/congrats of the user
+        log.music_team.info(f"PRE qual added for <@{slack_user_id}> {song.name} {part} {qual.date_time.strftime('%m/%d/%y')} by {escaped_requester_slack_id}")
+        output_list_buttons(channel_say,[],f"PRE qual added for <@{slack_user_id}> {song.name} {part} {qual.date_time.strftime('%m/%d/%y')}",context=context)
+        return
+    if len(args) < 3:
+        log.debug("need more args")
+        pre_help()
+        return
+    user_id = user_from_slack_id(args.pop(0))
+    if user_id is None:
+        log.debug("user_id is None")
+        return command_error(f"user {arguments[0]} has not been added to the system.  Please ask an admin to do so.",context,client,say,respond)
+        #pre_help()
+        #return
+    user = users_by_id[user_id]
+    user_name = user.name
+    user_slack_id = arguments[0]
+    if user_slack_id.startswith('<@'):
+        user_slack_id = user_slack_id[2:-1]
+
+    part = args.pop(0)
+    if part not in ['tenor','lead','bari','bass']:
+        pre_help()
+        return
+    if len(args) < 1:
+        pre_help()
+        return
+    lines = []
+    relevant_songs = []
+    for relevance,song in hint_sorted_songs(args):
+        if relevance > 0.99:
+            relevant_songs.append(song)
+        if relevance > 0.4:
+            log.debug([f"{relevance} - {song.name}: {song.id}",""])
+            lines.append([f"{song.name}",
+                f"pre pass @{user_name} {part}",
+                        f"pre pass {user_slack_id} {part} {song.name}" ])
+    if len(relevant_songs) == 1:
+        song = relevant_songs[0]
+        # we have everything we need, and song is obvious, so do it!
+        qual = create_qual(user,song,part)
+        #TODO: do some notification of the user
+        log.music_team.info(f"PRE qual added for <@{slack_user_id}> {song.name} {part} {qual.date_time.strftime('%m/%d/%y')} by {requester_slack_id}")
+        output_list_buttons(say,[],f"PRE qual added for <@{user_slack_id}> {song.name} {part} {qual.date_time.strftime('%m/%d/%y')}",context=context)
+    else:
+        if len(relevant_songs) == 0:
+            preamble = f"No songs found matching hints {args}."
+        else:
+            preamble = f"Matching songs for hints {args}."
+        lines.append([f"Didn't get what you wanted?  Press button to do interactively:","pre interact"])
+        output_list_buttons(say,lines,preamble,context=context)
+
+
+@command("pre interact",['evaluator'])
+def pre_interact(arguments,context,client,say=None,respond=None):
+    ''' record a PRE pass for a Singer Interactively
+        expected args: none necessary.  May give hints for user, part, and song.
+    '''
+    hints = arguments
+    songs_select = song_select_menu(hints)
+    parts_select = part_select_menu(hints)
+    if "trigger_id" not in context:
+        # output button so we have a trigger, which is required by slack to do modals
+        output_list_buttons(say,
+                [[f"Slack requires that you press this button to interact","pre interact "+" ".join(arguments)]],
+                None,
+                context=context)
+        return
+    private_metadata = {}
+    private_metadata['channel_id'] = context['channel']['id']
+    private_metadata['thread_ts'] = context['container']['thread_ts']
+
+    client.views_open(
+        # Pass a valid trigger_id within 3 seconds of receiving it
+        trigger_id=context["trigger_id"],
+        # View payload
+        view={
+            "type": "modal",
+            # View identifier
+            "callback_id": "pre interact",
+            "title": {"type": "plain_text", "text": "Record PRE Pass"},
+            "submit": {"type": "plain_text", "text": "Submit"},
+            "private_metadata": json.dumps(private_metadata),
+            "blocks": [
+                {
+                    "type": "input",
+                    "block_id": "users_select",
+                    "element": {
+                        "type": "users_select",
+                        "action_id": "user_selected",
+                        "placeholder": {
+                            "type": "plain_text",
+                            "text": "Select a Singer",
+                        }
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Singer",
+                        "emoji": True
+                    },
+                },
+                songs_select,
+                parts_select,
+                datepicker_block(),
+            ]
+        }
+    )
+
+@command("manage",[])
+def manage_command(arguments,context,client,say=None,respond=None):
+    '''__no_help__
+       placeholder for manage subcommands, use for subcommand typo resolution
+    '''
+    log.debug(f"manage called with {arguments}") 
+    if len(arguments):
+        arg_string = " ".join(arguments)
+        return command_error(f"'manage {arg_string}' is not a valid command.  'help' for legal commands",context,client,say,respond)
+    return command_error(f"'manage' requires a sub-command.  'help' for legal commands",context,client,say,respond)
+
+def manage_blocks(text_menu_list):
+    ''' text_menu_list is a list of 2-tuples: mrkdown_text,[overflow_data]
+        overflow_data is also a list of 2-tuples: label,value    value is dispatched as a command
+    '''
+    blocks = []
+    for mrkdown_txt,overflow_list in text_menu_list:
+        block = {
+			"type": "section",
+			"text": {
+				"type": "mrkdwn",
+				"text": mrkdown_txt
+			},
+			"accessory": {
+				"type": "overflow",
+				"action_id": "overflow-action"
+                }
+            }
+        options = []
+        for label,value in overflow_list:
+            options.append(
+					{
+						"text": {
+							"type": "plain_text",
+							"text": label,
+							"emoji": True
+						},
+						"value": value
+					}
+                )
+        block["accessory"]["options"] = options
+        blocks.append(block)
+    return blocks
+
+def song_by_tag_manage_blocks(alpha_sort=False):
+    if alpha_sort:
+        sort_key = None
+    else:
+        sort_key = lambda song: (song.difficulty,song.name)
+    blocks = []
+    printed_songs = []
+    for tag in sorted(tags):
+        blocks.extend(manage_blocks([(f"*{tag.name}*",[('manage tags','manage tags')])]))
+        sort_songs = sorted(tag.songs,key=sort_key)
+        for song in sort_songs:
+            blocks.extend(manage_blocks([(f"\u00A0\u00A0\u00A0\u00A0{song.name} {song.difficulty}",[('edit',f'manage song edit {song.id}')])]))
+    return blocks
+
+def update_manage_songs(context,client,view_id=None):
+    blocks = song_by_tag_manage_blocks()
+    if view_id is None:
+        log.warning(f"update_manage_songs: view_id is none, so using current")
+        view_id = context['view']['id']
+    log.debug(f"update_manage_songs: view_id={view_id}")
+    client.views_update(
+        #trigger_id=context["trigger_id"],
+        view_id=view_id,
+        view={
+            "type": "modal",
+            # View identifier
+            "callback_id": "manage tags interact",
+            "title": {"type": "plain_text", "text": "Manage Song Tags"},
+            #"submit": {"type": "plain_text", "text": "Submit"},
+            #"private_metadata": json.dumps(private_metadata),
+            "blocks": blocks
+        }
+    )
+
+@command("manage songs",['music_team'])
+def manage_songs(arguments,context,client,say=None,respond=None):
+    '''Manage songs
+       Manage songs to add/delete, or change sort order
+    '''
+    log.debug(f"manage_songs called with {arguments}") 
+    if "trigger_id" not in context:
+        # output button so we have a trigger, which is required by slack to do modals
+        output_list_buttons(say,
+                [[f"Slack requires that you press this button to interact","manage tags"]],
+                None,
+                context=context)
+        return
+    private_metadata = {}
+    private_metadata['channel_id'] = context['channel']['id']
+    private_metadata['thread_ts'] = context['container']['thread_ts']
+    blocks = song_by_tag_manage_blocks()
+    blocks.extend(manage_blocks([(f"Other Actions",[("Create New Song","manage song create_new")])]))
+
+    client.views_open(
+        trigger_id=context["trigger_id"],
+        view_id="manage_songs_interact",
+        # View payload
+        view={
+            "type": "modal",
+            # View identifier
+            "callback_id": "manage songs interact",
+            "title": {"type": "plain_text", "text": "Manage Songs"},
+            #"submit": {"type": "plain_text", "text": "Submit"},
+            "private_metadata": json.dumps(private_metadata),
+            "blocks": blocks
+        }
+    )
+
+def difficulty_select(selected=None):
+    block = {
+			"type": "input",
+            "block_id": "song_difficulty_select",
+			"element": {
+				"type": "static_select",
+				"placeholder": {
+					"type": "plain_text",
+					"text": "Select an item",
+					"emoji": True
+				},
+				"options": [],
+				"action_id": "difficulty_select-action"
+			},
+			"label": {
+				"type": "plain_text",
+				"text": "Difficulty",
+				"emoji": True
+			},
+			"optional": False
+		}
+    if selected is not None:
+        block["element"]["initial_option"] = {
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{selected}",
+                    "emoji": True
+                },
+                "value": f"{selected}"
+            }
+    for diff in range(0,10):
+        block["element"]["options"].append(
+                {
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"{diff}",
+                        "emoji": True
+                    },
+                    "value": f"{diff}"
+                }
+            )
+    return block
+
+def checkbox_option(text,value=None):
+    if value is None:
+        value=text
+    return {
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{text}",
+                    "emoji": True
+                },
+                #"description": {
+                    #"type": "plain_text",
+                    #"text": "description",
+                    #"emoji": True
+                #},
+                "value": f"{value}"
+            }
+
+def select_option(text,value=None):
+    if value is None:
+        value=text
+    return {
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{text}",
+                    "emoji": True
+                },
+                "value": f"{value}"
+            }
+
+def tag_checkbox_option(tag):
+    return checkbox_option(tag.name,tag.id)
+
+def tag_select_option(tag):
+    return select_option(tag.name,tag.id)
+
+def tag_select_block(selected_tags=[]):
+    block = {
+			"type": "input",
+            "block_id": "song_tag_select",
+            "label": {
+                "type": "plain_text",
+                "text": "Categories",
+                "emoji": True,
+                },
+            "optional": False,
+			"element": {
+                "type": "multi_static_select",
+                "action_id": "tag_select-action"
+            }
+		}
+    if selected_tags:
+        block["element"]["initial_options"] = [tag_select_option(t) for t in sorted(selected_tags)]
+    block["element"]["options"] = [tag_select_option(t) for t in sorted(tags)][:10]
+    return block
+
+def tag_checkboxes_block(selected_tags=[]):
+    block = {
+			"type": "actions",
+            "block_id": "song_tag_checkboxes",
+			"elements": [
+				{
+					"type": "checkboxes",
+					"action_id": "tag_checkbox-action"
+				}
+			]
+		}
+    if selected_tags:
+        block["elements"][0]["initial_options"] = [tag_checkbox_option(t) for t in sorted(selected_tags)]
+    block["elements"][0]["options"] = [tag_checkbox_option(t) for t in sorted(tags)][:10]
+    return block
+
+def auth_checkboxes_block(selected_auths):
+    # get around "" as default in auths
+    if "" in selected_auths:
+        selected_auths.remove("")
+    log.debug(f"selected_auths={selected_auths}")
+    block = {
+			"type": "actions",
+            "block_id": "auth_checkboxes",
+			"elements": [
+				{
+					"type": "checkboxes",
+					"action_id": "auth_checkbox-action"
+				}
+			]
+		}
+    if selected_auths:
+        block["elements"][0]["initial_options"] = [checkbox_option(t) for t in sorted(selected_auths)]
+    block["elements"][0]["options"] = [checkbox_option(t) for t in sorted(all_auths)]
+    log.debug(f"block={block}")
+    return block
+
+def datepicker_block(date=datetime.date.today()):
+    block = {
+            "type": "input",
+            "block_id": "datepicker",
+            "element": {
+                "type": "datepicker",
+                "initial_date": date.strftime("%Y-%m-%d"),
+                "action_id": "datepicker-action"
+            },
+            "label": {
+                "type": "plain_text",
+                "text": "Date",
+                "emoji": True
+            },
+            "optional": False
+        }
+    return block
+
+@command("manage song",['music_team'])
+def manage_song(arguments,context,client,say=None,respond=None):
+    '''__no_help__
+       Manage song to edit
+    '''
+    log.debug(f"manage_song called with {arguments}") 
+    if arguments[0] == 'create_new':
+        song = create_song("New Song")
+    if arguments[0] in ['edit','create_new']:
+        if arguments[0] == 'edit':
+            song_id = int(arguments[1])
+            song = songs_by_id[song_id]
+        #song_lines = '\n'.join(s.name for s in target_tag.songs)
+        blocks = [{
+                        "type": "input",
+                        "block_id": "song_name",
+                        "element": {
+                            "type": "plain_text_input",
+                            "initial_value": f"{song.name}",
+                            "action_id": "edit_song-action"
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "Name",
+                            "emoji": True
+                        },
+                        "optional": False
+                    }
+                ]
+        blocks.append(difficulty_select(selected=song.difficulty))
+        blocks.append(tag_select_block(song.tags))
+        log.debug(f"manage_song: blocks={blocks}")
+        log.debug(f"manage_song: setting external_id: {context['view']['id']}")
+        client.views_push(
+            trigger_id=context["trigger_id"],
+            view_id="manage_song_edit",
+            # View payload
+            view={
+                "type": "modal",
+                "external_id": context['view']['id'],
+                "notify_on_close": True,
+                "callback_id": "manage_song_edit",
+                "title": {"type": "plain_text", "text": f"Edit Song id {song.id}"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                #"private_metadata": json.dumps(private_metadata),
+                "blocks": blocks
+            }
+        )
+        ### stuff below here is from tags, should delete or convert to song
+        # zzz
+    elif arguments[0] == 'delete':
+        # for song delete, we want to check just mark it deleted
+        # TODO add "deleted" flag to song table
+        target_tag_id = int(arguments[1])
+        for tag in tags:
+            if tag.id == target_tag_id:
+                target_tag = tag
+                break
+        if len(target_tag.songs):
+            log.slack.error(f"Error:  Can't delete song tag that has songs assigned to it. {target_tag.name}")
+        else:
+            delete_tag(target_tag)
+            # repaint modal with updated sorting
+            update_tag_manage_view(context,client)
+    else:
+        command_error(f"'manage_song' got unsupported args {arguments}",context,client,say,respond)
+
+def manage_song_edit_submit(context,client,say=None,respond=None):
+    log.debug(f"values: {context['view']['state']['values']}")
+    name = context['view']['state']['values']['song_name']['edit_song-action']['value']
+    song_id = int(context['view']['title']['text'].split()[-1])
+    song = songs_by_id[song_id]
+    song_db_tag_ids = [x.id for x in song.tags]
+    log.debug(f"name: {name}   id: {song_id} db_tags: {song_db_tag_ids}")
+    difficulty = int(context['view']['state']['values']['song_difficulty_select']['difficulty_select-action']['selected_option']['value'])
+    log.debug(f"difficulty: {difficulty}")
+    selected_categories = context['view']['state']['values']['song_tag_select']['tag_select-action']['selected_options']
+    tag_ids = [ int(x['value']) for x in selected_categories ]
+    target_tags = [tag_from_id(x) for x in tag_ids]
+    log.debug(f"tag_ids: {tag_ids}")
+    song.update(name=name,difficulty=difficulty,tags=target_tags)
+    return True # this refreshes parent view
+
+def admin_user_edit_submit(context,client,say=None,respond=None):
+    values = context['view']['state']['values']
+    log.debug(f"values: {values}")
+    name = context['view']['state']['values']['user_name']['rename_user-action']['value']
+    user_id = int(context['view']['title']['text'].split()[-1])
+    user = users_by_id[user_id]
+    selected_checkboxes = values['auth_checkboxes']['auth_checkbox-action']['selected_options']
+    auths = [ x['value'] for x in selected_checkboxes ]
+    log.debug(f"user_id: {user.id}  old_name:{user.name} new_name: {name} auths: {auths}")
+    user.update(name=name,auth_list=auths)
+    return False # this says do not refresh parent view
+
+
+def tag_manage_blocks():
+    menu_list = []
+    for tag in sorted(tags):
+        accessory_list = []
+        for label,action in [
+                ("move up","sort_up"),
+                ("move down","sort_down"),
+                ("rename","rename"),
+                ("delete","delete"),
+                ]:
+            accessory_list.append((f"{label}",f"manage tag {action} {tag.id}"))
+        menu_list.append((f"*{tag.name}* _({len(tag.songs)} songs)_",accessory_list))
+    menu_list.append((f"Other Actions",[("Create New Tag","manage tag create_new")]))
+    return manage_blocks(menu_list)
+
+def update_tag_manage_view(context,client,view_id=None):
+    blocks = tag_manage_blocks()
+    if view_id is None:
+        view_id = context['view']['id']
+    client.views_update(
+        #trigger_id=context["trigger_id"],
+        view_id=view_id,
+        view={
+            "type": "modal",
+            # View identifier
+            "callback_id": "manage tags interact",
+            "title": {"type": "plain_text", "text": "Manage Song Tags"},
+            #"submit": {"type": "plain_text", "text": "Submit"},
+            #"private_metadata": json.dumps(private_metadata),
+            "blocks": blocks
+        }
+    )
+
+@command("manage tag",['music_team'])
+def manage_tag(arguments,context,client,say=None,respond=None):
+    '''__no_help__
+       Manage song tag to change sort order
+    '''
+    log.debug(f"manage_tag called with {arguments}") 
+    if arguments[0] == 'sort_up' or arguments[0] == 'sort_down':
+        if arguments[0] == 'sort_up':
+            insert_offset = -1
+        else:
+            insert_offset = 1
+        target_tag_id = int(arguments[1])
+        sorted_tag_list = sorted(tags)
+        target_tag_index = None
+        for index,tag in enumerate(sorted_tag_list):
+            if tag.id == target_tag_id:
+                target_tag_index = index
+                target_tag = tag
+                break
+        sorted_tag_list.remove(target_tag)
+        insertion_index = target_tag_index + insert_offset
+        if insertion_index < 0:
+            insertion_index = 0
+        sorted_tag_list.insert(insertion_index,target_tag)
+        reorder_tags(sorted_tag_list)
+
+        # repaint modal with updated sorting
+        update_tag_manage_view(context,client)
+    elif arguments[0] == 'rename':
+        target_tag_id = int(arguments[1])
+        for tag in tags:
+            if tag.id == target_tag_id:
+                target_tag = tag
+                break
+        song_lines = '\n'.join(s.name for s in target_tag.songs)
+        #target_tag.songs
+        #client.views_open(
+        client.views_push(
+            trigger_id=context["trigger_id"],
+            view_id="manage_tag_rename",
+            # View payload
+            view={
+                "type": "modal",
+                "external_id": context['view']['id'],
+                "notify_on_close": True,
+                "callback_id": "manage tag rename",
+                "title": {"type": "plain_text", "text": f"Rename Tag id {target_tag.id}"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                #"private_metadata": json.dumps(private_metadata),
+                "blocks": [{
+                        "type": "input",
+                        "block_id": "tag_name",
+                        "element": {
+                            "type": "plain_text_input",
+                            "initial_value": f"{target_tag.name}",
+                            "action_id": "rename_tag-action"
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "Name",
+                            "emoji": True
+                        },
+                        "optional": False
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"FYI, this tag is assigned to the following songs.  Either rename appropriately, or fix tag mappings after.\n{song_lines}"
+                        },
+                    },
+                ]
+            }
+        )
+    elif arguments[0] == 'create_new':
+        client.views_push(
+            trigger_id=context["trigger_id"],
+            view_id="manage_tag_create_new",
+            # View payload
+            view={
+                "type": "modal",
+                "external_id": context['view']['id'],
+                "notify_on_close": True,
+                "callback_id": "manage tag create_new",
+                "title": {"type": "plain_text", "text": "Create New Song Tag"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                #"private_metadata": json.dumps(private_metadata),
+                "blocks": [{
+                        "type": "input",
+                        "block_id": "tag_name",
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "create_new_tag-action"
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "Name",
+                            "emoji": True
+                        },
+                        "optional": False
+                    }
+                ]
+            }
+        )
+    elif arguments[0] == 'delete':
+        target_tag_id = int(arguments[1])
+        for tag in tags:
+            if tag.id == target_tag_id:
+                target_tag = tag
+                break
+        if len(target_tag.songs):
+            log.slack.error(f"Can't delete song tag that has songs assigned to it.  {target_tag.name}")
+        else:
+            log.music_team.info(f"Deleting song tag {target_tag.name}.")
+            delete_tag(target_tag)
+            # repaint modal with updated sorting
+            update_tag_manage_view(context,client)
+    else:
+        command_error(f"'manage_tag' got unsupported args {arguments}",context,client,say,respond)
+
+
+@command("manage tags",['music_team'])
+def manage_tags(arguments,context,client,say=None,respond=None):
+    '''Manage tags
+       Manage song tags to add/delete, or change sort order
+    '''
+    log.debug(f"manage_tages called with {arguments}") 
+    if "trigger_id" not in context:
+        # output button so we have a trigger, which is required by slack to do modals
+        output_list_buttons(say,
+                [[f"Slack requires that you press this button to interact","manage tags"]],
+                None,
+                context=context)
+        return
+    private_metadata = {}
+    private_metadata['channel_id'] = context['channel']['id']
+    private_metadata['thread_ts'] = context['container']['thread_ts']
+    blocks = tag_manage_blocks()
+
+    client.views_open(
+        trigger_id=context["trigger_id"],
+        view_id="manage_tags_interact",
+        # View payload
+        view={
+            "type": "modal",
+            # View identifier
+            "callback_id": "manage tags interact",
+            "title": {"type": "plain_text", "text": "Manage Song Tags"},
+            #"submit": {"type": "plain_text", "text": "Submit"},
+            "private_metadata": json.dumps(private_metadata),
+            "blocks": blocks
+        }
+    )
+
+
+def part_select_menu(hints):
+    option_objects = []
+    for part_name in ['Tenor','Lead','Bari','Bass']:
+        option_objects.append(
+            {
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{part_name}"
+                    },
+                "value": f"{part_name}"
+            } 
+        )
+    return {
+        "type": "input",
+        "block_id": "parts_select",
+        "element": {
+            "action_id": "part_selected",
+            "type": "static_select",
+            "placeholder": {
+                "type": "plain_text",
+                "text": "Select a part"
+            },
+            "options": option_objects
+        },
+        "label": {
+            "type": "plain_text",
+            "text": "Part",
+            "emoji": True
+        },
+
+    }
+
+def song_select_menu(hints):
+    option_objects = []
+    for (relevance,song) in hint_sorted_songs(hints):
+        # show all if no hints, otherwise, anything that matches
+        if hints and relevance < 0.1:
+            break
+        option_objects.append(
+            {
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{song.name}"
+                    },
+                "value": f"{song.id}"
+            } 
+        )
+    return {
+        "type": "input",
+        "block_id": "songs_select",
+        "element": {
+            "action_id": "song_selected",
+            "type": "static_select",
+            "placeholder": {
+                "type": "plain_text",
+                "text": "Select a song"
+            },
+            "options": option_objects
+        },
+        "label": {
+            "type": "plain_text",
+            "text": "Song",
+            "emoji": True
+        },
+    }
+
+def hint_sorted_songs(hints):
+    '''
+        output a list of sorted tuples, each containing (relevance,song)
+        relevance is based on the 'hints' list.  Hints can be words in the title,
+            song tags, (in the future, other metadata songs may have)
+    '''
+    lower_hints = [ x.lower() for x in hints ]
+    if hints:
+        hint_count = float(len(hints))
+    else:
+        hint_count = 1
+    tuples = []
+    for song in songs:
+        relevance = 0
+        song_tags = " ".join([tag.name.lower() for tag in song.tags])
+        for hint in lower_hints:
+            if hint in song.name.lower():
+                relevance += 1
+            if hint in song_tags:
+                relevance += 1
+        tuples.append((relevance/hint_count,song))
+    tuples.sort(reverse=True)
+    return tuples
+
+
