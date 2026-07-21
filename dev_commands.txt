@@ -1,0 +1,27 @@
+# alembic (for database revisions)
+
+  668  pip install alembic
+  675  alembic init alembic
+  676  vi alembic.ini 
+  678  cd alembic/
+  682  alembic revision --autogenerate -m "checkin message"
+  685  cd alembic/versions/
+  825  alembic upgrade head # will also generate new DB file 
+	#	if old is lost/moved
+
+# git (version control)
+
+  793  git diff
+  798  git commit -a  # commit changes in files already tracked
+  799  git add <filename>  # add new file to tracking, 
+	# or stage changes in known file for subsequent "git commit"
+  801  git commit  # for staged changes. use "-a" for unstaged in known files
+  802  git push origin
+  807  git log
+
+# run in backround on machine you ssh into
+   $ cd .../btsbot
+   $ source activate_script
+   $ nohup python3 app.py &
+   $ tail -f logs/btsbot.log
+
