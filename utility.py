@@ -172,6 +172,43 @@ def select_quals (
             reduced_list.append(current_q)
     return reduced_list
 
+def song_qual_counts_by_part(song,quals):
+    log.debug(f"enter qual_counts. song:{song.name} quals:{len(quals)}")
+    log.debug(f"song parts:{song.parts}")
+    if quals:
+        log.debug(f"first qual:{quals[0]}")
+    qual_counters = dict()
+    part_name_by_id={}
+    part_print_order = ['Tenor','Lead','Bari','Bass']
+    qual_counters['__part_print_order__'] = part_print_order
+    for song_part in song.parts:
+        part_name = song_part.part.name
+        part_id = song_part.part_id
+        part_name_by_id[part_id] = part_name
+        if part_name not in part_print_order:
+            log.info(f"adding unexpected part {part_name}")
+            part_print_order.append(part_name)
+            qual_counters[part_name] = 0
+    for part in part_print_order:
+        qual_counters[part] = 0
+    #TODO ideally, should be unexpired...
+    for qual in select_quals(quals,song_id=song.id,only_most_recent=True):
+        log.debug(f"{qual}")
+        part_name = part_name_by_id[qual.part_id]
+        qual_counters[part_name] += 1
+
+    return qual_counters
+
+
+
+
+
+
+
+
+
+
+
 def song_permutations(qual_list,parts_to_fill,debug=False):
     '''
     return a list of tuples (len,used_quals,missing_parts)

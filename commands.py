@@ -4,6 +4,7 @@ from slack_sdk.errors import SlackApiError
 
 from utility import select_quals,slack_user_id_from_context,command_words_from_context,authorized
 from utility import slack_ts_from_context,user_from_slack_id,qual_strength,normalize_slack_id
+from utility import song_qual_counts_by_part
 import utility
 
 import functools
@@ -729,12 +730,22 @@ def song_by_tag_manage_blocks(alpha_sort=False):
     else:
         sort_key = lambda song: (song.difficulty,song.name)
     blocks = []
-    printed_songs = []
+    unprinted_songs = sorted(songs)
     for tag in sorted(tags):
         blocks.extend(manage_blocks([(f"*{tag.name}*",[('manage tags','manage tags')])]))
         sort_songs = sorted(tag.songs,key=sort_key)
         for song in sort_songs:
-            blocks.extend(manage_blocks([(f"\u00A0\u00A0\u00A0\u00A0{song.name} {song.difficulty}",[('edit',f'manage song edit {song.id}')])]))
+            part_counters = song_qual_counts_by_part(song,quals)
+            part_count_txt = "/".join([str(part_counters[name]) for name in part_counters['__part_print_order__']])
+            blocks.extend(manage_blocks([(f"\u00A0\u00A0\u00A0\u00A0{song.name} quals: {part_count_txt}  diff:{song.difficulty}",[('edit',f'manage song edit {song.id}')])]))
+            if song in unprinted_songs:
+                unprinted_songs.remove(song)
+    if unprinted_songs:
+        blocks.extend(manage_blocks([(f"*<untagged>*",[('manage tags','manage tags')])]))
+        for song in unprinted_songs:
+            part_counters = song_qual_counts_by_part(song,quals)
+            part_count_txt = "/".join([str(part_counters[name]) for name in part_counters['__part_print_order__']])
+            blocks.extend(manage_blocks([(f"\u00A0\u00A0\u00A0\u00A0{song.name} quals: {part_count_txt}  diff:{song.difficulty}",[('edit',f'manage song edit {song.id}')])]))
     return blocks
 
 def update_manage_songs(context,client,view_id=None):
@@ -957,6 +968,8 @@ def manage_song(arguments,context,client,say=None,respond=None):
             song_id = int(arguments[1])
             song = songs_by_id[song_id]
         #song_lines = '\n'.join(s.name for s in target_tag.songs)
+        part_counters = song_qual_counts_by_part(song,quals)
+        log.debug(f"part_counters: {part_counters}")
         blocks = [{
                         "type": "input",
                         "block_id": "song_name",
