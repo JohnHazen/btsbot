@@ -1,6 +1,7 @@
 # files for instance-specific data
 btsbotdb
 btsbot.env
+devbot.env
 backup/
 # vi/vim working files
 *.swp

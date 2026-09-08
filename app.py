@@ -68,15 +68,22 @@ def handle_pre_interact_submit(ack, body, say, respond, client):
 view_submit_re = re.compile("""^(
         manage_song_edit |
         admin_user_edit |
-        foobar
+        setlist_item_edit |
+        manage_gig |
+        manage_gig_add_song
         )$""", re.VERBOSE)
 
 #TODO fold in the special cases to generic handler
 
 @app.view(view_submit_re)
 def handle_generic_submit(ack, body, say, respond, client):
-    ack()
-    return commands.handle_submit(body,client,say=say)
+    errors = commands.handle_submit(body,client,say=say)
+    # errors should be a dict with block_id keys and err_msg text values
+    #  to get slack to show messages
+    if errors:
+        ack(response_action="errors",errors=errors)
+    else:
+        ack()
 
 @app.view("manage tag create_new")
 def handle_create_new_tag_submit(ack, body, say, respond, client):
@@ -331,7 +338,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_TERM_signal)
     # handle SIGUSR1 to do scheduled tasks
     signal.signal(signal.SIGUSR1, handle_USR1_signal)
-    if "SLACK_LOG_CHANNEL_ID" in os.environ:
+    if "SLACK_LOG_CHANNEL_ID" in os.environ and "SUPPRESS_SLACK_LOGS" not in os.environ:
         log.generate_slack_sink(app.client,os.environ['SLACK_LOG_CHANNEL_ID'])
     else:
         log.warning("No 'SLACK_LOG_CHANNEL_ID' found in environment.  Logging to slack disabled.")

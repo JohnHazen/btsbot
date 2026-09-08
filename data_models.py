@@ -30,7 +30,7 @@ from openpyxl.styles.borders import Border, Side
 from openpyxl.utils import get_column_letter
 
 import utility
-from utility import select_quals
+from utility import select_quals,assign_parts
 #from utility import select_quals,DAYS_TO_QUAL_EXPIRATION,WARN_DAYS_PRIOR_TO_QUAL_EXPIRATION
 
 class Base(MappedAsDataclass, DeclarativeBase):
@@ -41,6 +41,11 @@ class Base(MappedAsDataclass, DeclarativeBase):
 song_tag_table = Table("SongTag",Base.metadata,
     Column("song_id", ForeignKey("Song.id"), primary_key=True),
     Column("tag_id", ForeignKey("Tag.id"), primary_key=True),
+    )
+
+gig_singer_table = Table("GigSinger",Base.metadata,
+    Column("user_id", ForeignKey("User.id"), primary_key=True),
+    Column("gig_id", ForeignKey("Gig.id"), primary_key=True),
     )
 
 
@@ -105,15 +110,24 @@ class Song(Base):
         )
     parts: Mapped[List[SongVoicePart]] = relationship()
     difficulty: Mapped[int] = mapped_column(Integer, default = 0)
+    duration: Mapped[int] = mapped_column(Integer, init=False, nullable=True) #in seconds
+    written_key: Mapped[str] = mapped_column(String(8),init=False, nullable=True)
+    performance_key: Mapped[str] = mapped_column(String(8),init=False, nullable=True)
 
     def __lt__(self,other):
         return self.name < other.name
 
-    def update(self,name=None,tags=None,difficulty=None):
+    def update(self,name=None,tags=None,difficulty=None,written_key=None,performance_key=None,duration=None):
         if name is not None:
             self.name = name
         if difficulty is not None:
             self.difficulty = difficulty
+        if written_key is not None:
+            self.written_key = written_key
+        if performance_key is not None:
+            self.performance_key = performance_key
+        if duration is not None:
+            self.duration = duration
         if tags is not None:
             target_tags = set(tags)
             current_tags = set(self.tags)
@@ -156,6 +170,7 @@ class VoicePart(Base):
 class SongVoicePart(Base):
     __tablename__ = "SongVoicePart"
 
+    # TODO fix below to be ints (I think just annotations, so shouldn't break anything
     song_id: Mapped[str] = mapped_column(ForeignKey("Song.id"), init=False, primary_key=True)
     part_id: Mapped[str] = mapped_column(ForeignKey("VoicePart.id"), init=False, primary_key=True)
     part: Mapped["VoicePart"] = relationship(init=False)
@@ -163,10 +178,28 @@ class SongVoicePart(Base):
     range_high: Mapped[int] = mapped_column(init=False, nullable=True)
     sort_order: Mapped[int] = mapped_column(init=False, nullable=True)
 
+    def __lt__(self,other):
+        if self.sort_order == other.sort_order:
+            return self.part_id < other.part_id
+        return self.sort_order < other.sort_order
+        
+
+    def update(self,sort_order=None,range_low=None,range_high=None):
+        log.debug(f"SongVoicePart update - sort_order={sort_order} range_low={range_low} range_high={range_high}")
+        if sort_order is not None:
+            self.sort_order = sort_order
+        if range_low is not None:
+            self.range_low = range_low
+        if range_high is not None:
+            self.range_high = range_high
+        session.add(self)
+        session.commit()
+
 class SongVoicePartQual(Base):
     __tablename__ = "SongVoicePartQual"
 
     id: Mapped[int] = mapped_column(init=False, primary_key=True)
+    # TODO fix below to be ints (I think just annotations, so shouldn't break anything
     user_id: Mapped[str] = mapped_column(ForeignKey("User.id"), init=False)
     song_id: Mapped[str] = mapped_column(ForeignKey("Song.id"), init=False)
     part_id: Mapped[str] = mapped_column(ForeignKey("VoicePart.id"), init=False)
@@ -176,6 +209,362 @@ class SongVoicePartQual(Base):
 
     def __lt__(self,other):
         return self.id < other.id
+
+class GigSetListItem(Base):
+    ''' use these items to build a setlist.  They may refer to a song, or just be used for the comment
+        to indicate a speaking part...
+    '''
+    __tablename__ = "GigSetListItem"
+
+    id: Mapped[int] = mapped_column(init=False, primary_key=True)
+    gig_id: Mapped[int] = mapped_column(ForeignKey("Gig.id"), init=False)
+    song_id: Mapped[int] = mapped_column(ForeignKey("Song.id"), init=False, nullable=True)
+    sort_order: Mapped[int] = mapped_column(init=False, nullable=True)
+    duration: Mapped[int] = mapped_column(init=False, nullable=True) # seconds
+    song_key: Mapped[str] = mapped_column(String(8),init=False, nullable=True)
+    in_setlist: Mapped[bool] = mapped_column(init=False, unique=False, default=False)
+    comments: Mapped[str] = mapped_column(String(255),init=False, nullable=True)
+
+    def __lt__(self,other):
+        if self.sort_order == other.sort_order and self.in_setlist != other.in_setlist:
+            return self.in_setlist
+        return self.sort_order < other.sort_order
+
+    def update(self,sort_order=None,in_setlist=None,song_key=None,duration=None,comments=None):
+        log.debug(f"SetListItem update - sort_order={sort_order}  in_setlist={in_setlist} song_key={song_key} duration={duration},comments={comments}")
+        if sort_order is not None:
+            self.sort_order = sort_order
+        if in_setlist is not None:
+            self.in_setlist = in_setlist
+        if song_key is not None:
+            self.song_key = song_key
+        if comments is not None:
+            self.comments = comments
+        if duration is not None:
+            self.duration = duration
+        session.add(self)
+        session.commit()
+
+class GigSongVoicePartAssignment(Base):
+    __tablename__ = "GigSongVoicePartAssignment"
+
+    id: Mapped[int] = mapped_column(init=False, primary_key=True)
+    gig_id: Mapped[int] = mapped_column(ForeignKey("Gig.id"), init=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("User.id"), init=True)
+    song_id: Mapped[int] = mapped_column(ForeignKey("Song.id"), init=True)
+    part_id: Mapped[int] = mapped_column(ForeignKey("VoicePart.id"), init=True)
+    date_time: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), init=False, nullable=True)
+    performance_ready: Mapped[bool] = mapped_column(init=False, unique=False, default=True)
+    waiver: Mapped[bool] = mapped_column(init=False, unique=False, default=False)
+    sort_order: Mapped[int] = mapped_column(init=False, nullable=True)
+    comments: Mapped[str] = mapped_column(String(255),init=False, nullable=True)
+
+    def emoji(self):
+        if self.waiver:
+            return ":white_check_mark:"
+        if self.performance_ready:
+            return ":large_green_circle:"
+        if self.date_time is not None:
+            return ":red_circle:"
+        return ":negative_squared_cross_mark:"
+        return ":black_circle:"
+        return ":x:"
+        return ":large_yellow_circle:"
+        return ":thumbsup:"
+
+
+    def __lt__(self,other):
+        return self.sort_order < other.sort_order
+        return self.id < other.id
+
+    def update(self,sort_order=None,performance_ready=None,waiver=None,comments=None):
+        log.debug(f"PartAssignment update - sort_order={sort_order}  performance_ready={performance_ready} waiver={waiver} comments={comments}")
+        if sort_order is not None:
+            self.sort_order = sort_order
+        if performance_ready is not None:
+            self.performance_ready = performance_ready
+        if waiver is not None:
+            self.waiver = waiver
+        if comments is not None:
+            self.comments = comments
+        session.add(self)
+        session.commit()
+
+class Gig(Base):
+    __tablename__ = "Gig"
+
+    id: Mapped[int] = mapped_column(init=False, primary_key=True)
+    location: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(String(255))
+    comments: Mapped[str] = mapped_column(String(255), init=False, default="")
+    singers: Mapped[List[User]] = relationship(
+        secondary=gig_singer_table)
+    setlist: Mapped[List[GigSetListItem]] = relationship(init=False)
+    assignments: Mapped[List[GigSongVoicePartAssignment]] = relationship(init=False)
+    date_time: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), init=False, nullable=True)
+    duration: Mapped[int] = mapped_column(Integer, init=False, default=0)   # in minutes
+    active: Mapped[bool] = mapped_column(init=False, unique=False, default=True)
+    thread_ts: Mapped[str] = mapped_column(String(255),init=False,default="")
+
+    def __lt__(self,other):
+        return self.date_time < other.date_time
+
+    def update(self,location=None,description=None,comments=None,singers=None,
+                date_time=None,duration=None,active=None):
+        log.debug(f"Gig update - location={location} description={description} comments={comments} singers={singers} date_time={date_time} duration={duration} active={active}")
+        if location is not None:
+            self.location = location
+        if description is not None:
+            self.description = description
+        if comments is not None:
+            self.comments = comments
+        if date_time is not None:
+            self.date_time = date_time
+        if duration is not None:
+            self.duration = duration
+        if active is not None:
+            self.active = active
+        session.add(self)
+        session.commit()
+        if singers is not None:
+            self.update_singers(singers)
+
+    def setlist_duration(self):
+        duration = 0
+        for item in sorted(self.setlist):
+            if item.comments == "-- END SETLIST --":
+                return duration
+            try:
+                duration += item.duration
+            except:
+                log.warning(f"error computing set duration for gig {self.description}")
+        log.error(f"error computing set duration for gig {self.description}.  No END marker.")
+
+    def delete_setlist_item(self,item):
+        '''
+            remove setlist_item
+            - then remove all relevant assignments
+        '''
+        log.debug(f"Gig delete_setlist_item - item={item}")
+        if item not in self.setlist:
+            log.error(f"tried to delete item not in this gig's setlist.")
+            return
+        if item.song_id is not None:
+            assignments_left_over = []
+            for a in self.assignments:
+                if a.song_id == item.song_id:
+                    session.delete(a)
+                else:
+                    assignments_left_over.append(a)
+        self.setlist.remove(item)
+        session.delete(item)
+        self.assignments = assignments_left_over
+        session.add(self)
+        session.commit()
+
+    def add_setlist_item(self,song_id=None,comments=None):
+        '''
+            add setlist_item
+            - then make sure to add singers' assignments
+        '''
+        log.debug(f"Gig add_setlist_item - song_id={song_id} comments={comments}")
+        end_setlist_item = [i for i in self.setlist if i.comments == '-- END SETLIST --'][0]
+        insert_point = self.setlist.index(end_setlist_item)
+        item=GigSetListItem()
+        item.gig_id = self.id
+        item.comments = comments
+        item.sort_order = end_setlist_item.sort_order
+        item.in_setlist = True
+        if song_id is not None:
+            item.song_id = song_id
+
+            # add new assignments for new singers/songs
+            singer_quals = select_quals(quals,song_id=song_id,
+                    user_ids=[x.id for x in self.singers],only_most_recent=True)
+            for qual in singer_quals:
+                expiry = QualExpirationData(qual,target_date=self.date_time)
+                part_assignment = GigSongVoicePartAssignment(
+                            gig_id=self.id,
+                            user_id=qual.user_id,
+                            song_id=qual.song_id,
+                            part_id=qual.part_id)
+                part_assignment.date_time=qual.date_time
+                part_assignment.performance_ready = expiry.valid
+                part_assignment.sort_order = expiry.sort_order
+                if not expiry.valid:
+                    part_assignment.sort_order += 1000
+                self.assignments.append(part_assignment)
+
+            self.assignments = sorted(self.assignments)
+
+            # now add non-qual assignments for dropdown menus
+            song = songs_by_id[item.song_id]
+            item.duration = song.duration
+            item.song_key = song.performance_key if song.performance_key else song.written_key
+            for singer in self.singers:
+                for part in sorted(song.parts):
+                    if not [a for a in self.assignments if (a.part_id == part.part.id 
+                            and a.song_id == item.song_id and a.user_id == singer.id)]:
+                        # no existing qual-based-assignment, so create one
+                        part_assignment = GigSongVoicePartAssignment(
+                                    gig_id=self.id,
+                                    user_id=singer.id,
+                                    song_id=song.id,
+                                    part_id=part.part.id)
+                        part_assignment.performance_ready = False
+                        part_assignment.sort_order = 2000
+                        self.assignments.append(part_assignment)
+
+            log.debug(f"assigning parts for {song.name}")
+            assign_parts(song,[a for a in self.assignments if a.song_id==song.id])
+
+
+        self.setlist.insert(insert_point,item)
+        session.add(item)
+        session.add(self)
+        session.commit()
+
+    def update_singers(self,singers=None):
+        ''' add or subtract singers
+                pass end_state singer list
+            Steps:
+            - add/remove actual singers
+            - remove (now) unused assignments
+            - add any new songs to setlist
+            - add new assignments for new singers/songs
+            - auto-assign new songs
+        '''
+        log.debug(f"Gig update_singers - singers={singers}")
+        if singers is None:
+            return
+        gig_singers = set(self.singers)
+        new_singers = set(singers)
+        if gig_singers == new_singers:
+            log.debug(f"Gig update_singers - Singers didn't change.  Nothing to do.")
+            return
+        # add/remove actual singers
+        self.singers = singers
+        added_singers = new_singers - gig_singers
+        deleted_singers = gig_singers - new_singers
+        log.debug(f"adding singers: {added_singers}  Removing singers: {deleted_singers}")
+        added_singer_ids = [x.id for x in added_singers]
+        deleted_singer_ids = [x.id for x in deleted_singers]
+
+        # remove (now) unused assignments
+        kept_assignments = [x for x in self.assignments if x.user_id not in deleted_singer_ids]
+        for assignment in [x for x in self.assignments if x.user_id in deleted_singer_ids]:
+            session.delete(assignment)
+        self.assignments = kept_assignments
+
+        # add any new songs to setlist
+        self.setlist = sorted(self.setlist)
+        singer_quals = select_quals(quals,user_ids=[x.id for x in singers],only_most_recent=True)
+        set_song_ids = [x.song_id for x in self.setlist]
+        if self.setlist:
+            end_setlist_item = [i for i in self.setlist if i.comments == '-- END SETLIST --'][0]
+            insert_point = self.setlist.index(end_setlist_item)
+            last_setlist_item_index = insert_point - 1
+            if last_setlist_item_index < 0:
+                last_setlist_item_index = 0
+            sort_order = self.setlist[last_setlist_item_index].sort_order
+        else:
+            end_setlist_item = GigSetListItem()
+            end_setlist_item.sort_order = 50
+            end_setlist_item.comments = "-- END SETLIST --"
+            end_setlist_item.in_setlist = False
+            self.setlist.append(end_setlist_item)
+            insert_point = 0
+            sort_order = 0
+        sorted_songs = sorted([(utility.qual_strength(singer_quals,s),s) for s in songs],reverse=True)
+        performable = True
+        new_setlist_items = []
+        for ((qual_strength,missing_parts),song) in sorted_songs:
+            if song.id in set_song_ids:
+                log.debug(f"skipping {song.name} -- already in setlist")
+                continue
+            sort_order += 1
+            if qual_strength < 0 and performable:
+                performable = False
+                insert_point += 1 # move from inserting *before* end-marker, to inserting after
+                end_setlist_item.sort_order = sort_order
+                sort_order += 100
+                log.debug(f"first non-performable: {song.name}")
+            if qual_strength < -1:
+                break
+            log.debug(f"adding song: {song.name}")
+            setlist_item=GigSetListItem()
+            setlist_item.gig_id=self.id
+            setlist_item.song_id=song.id
+            setlist_item.duration=song.duration
+            setlist_item.song_key = song.performance_key if song.performance_key else song.written_key
+            setlist_item.sort_order=sort_order
+            setlist_item.in_setlist=performable
+            self.setlist.insert(insert_point,setlist_item)
+            new_setlist_items.append(setlist_item)
+            insert_point += 1
+
+        # add new assignments for new singers/songs
+        set_song_ids = [x.song_id for x in self.setlist]
+        singer_quals = select_quals(quals,user_ids=[x.id for x in self.singers],only_most_recent=True)
+        for qual in singer_quals:
+            if qual.song_id not in set_song_ids:
+                continue
+            # check if there's already an assignment for this qual
+            qual_assignments = [x for x in self.assignments if (x.user_id==qual.user_id 
+                and x.song_id == qual.song_id and x.part_id==qual.part_id)]
+            if qual_assignments:
+                # leave sort_order, in case it's been assigned, but update date_time and performance_ready
+                qual_assignments[0].date_time = qual.date_time
+                qual_assignments[0].performance_ready = qual.performance_ready
+            else:
+                #create new assignment
+                expiry = QualExpirationData(qual,target_date=self.date_time)
+                part_assignment = GigSongVoicePartAssignment(
+                            gig_id=self.id,
+                            user_id=qual.user_id,
+                            song_id=qual.song_id,
+                            part_id=qual.part_id)
+                part_assignment.date_time=qual.date_time
+                part_assignment.performance_ready = expiry.valid
+                part_assignment.sort_order = expiry.sort_order
+                if not expiry.valid:
+                    part_assignment.sort_order += 1000
+                self.assignments.append(part_assignment)
+        self.assignments = sorted(self.assignments)
+
+        # now add non-qual assignments so singer shows up in pulldowns for non-qual gigs.
+        # and auto-assign parts for new setlist_items and older items not in setlist 
+        #   (in case adding new singers makes a quartet)  Figure items in setlist have already 
+        #   been assigned, so leave them alone.
+        in_setlist = True
+        for setlist_item in self.setlist:
+            if setlist_item is end_setlist_item:
+                in_setlist = False
+            if setlist_item.song_id is None:
+                continue
+            song = songs_by_id[setlist_item.song_id]
+            #for singer in added_singers:
+            for singer in self.singers:
+                for part in sorted(song.parts):
+                    if not [a for a in self.assignments if (a.part_id == part.part.id 
+                            and a.song_id == setlist_item.song_id and a.user_id == singer.id)]:
+                        # no existing qual-based-assignment, so create one
+                        part_assignment = GigSongVoicePartAssignment(
+                                    gig_id=self.id,
+                                    user_id=singer.id,
+                                    song_id=song.id,
+                                    part_id=part.part.id)
+                        part_assignment.performance_ready = False
+                        part_assignment.sort_order = 2000
+                        self.assignments.append(part_assignment)
+
+            # auto-assign new songs
+            if setlist_item in new_setlist_items or not in_setlist:
+                log.debug(f"assigning parts for {song.name}")
+                assign_parts(song,[a for a in self.assignments if a.song_id==song.id])
+
+        session.add(self)
+        session.commit()
 
 class Note(object):
     names = ["C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"]
@@ -270,7 +659,16 @@ class QualExpirationData:
     emoji: str = field(init=False)
     '''
 
-    def __init__(self,qual_or_date):
+    def __init__(self,qual_or_date,target_date=None):
+        if target_date is None:
+            target_date = datetime.date.today()
+            #target_date = datetime.datetime.now()
+        else:
+            #try to turn datetimes into dates
+            try:
+                target_date = target_date.date()
+            except AttributeError:
+                pass
         if type(qual_or_date) == SongVoicePartQual:
             self.qual = qual_or_date
             #self.date = qual_or_date.date_time.date()
@@ -284,17 +682,21 @@ class QualExpirationData:
             self.date = self.date.date()
         except AttributeError:
             pass
-        days_since_qual = datetime.date.today() - self.date
+        days_since_qual = target_date - self.date
         self.days = (datetime.timedelta(days=utility.DAYS_TO_QUAL_EXPIRATION) - days_since_qual).days
         if self.days < 0:
             self.emoji = ":red_circle:"
             self.status = f'Expired {-1*self.days} days ago'
+            self.valid = False
         elif self.days < utility.WARN_DAYS_PRIOR_TO_QUAL_EXPIRATION:
             self.emoji = ":large_yellow_circle:"
             self.status = f'Expiring in {self.days} days'
+            self.valid = True
         else:
             self.emoji = ":large_green_circle:"
             self.status = f'Good for {self.days} more days'
+            self.valid = True
+        self.sort_order = days_since_qual.days
 
     def __lt__(self,other):
         return self.days < other.days
@@ -489,6 +891,78 @@ def create_qual(singer,song,part_name,date=None):
     session.commit()
     quals.append(qual)
     return qual
+
+def create_gig(singer_ids,date_time=None,location="",description="",thread_ts=""):
+    if date_time is None:
+        date_time = datetime.datetime.now() + datetime.timedelta(days=14)
+    #gig = Gig(location,description,[users_by_id[s] for s in singer_ids])
+    gig = Gig(location,description,[])
+    #commit gig to get ID
+    session.add(gig)
+    session.commit()
+    gig.date_time=date_time
+    gig.thread_ts=thread_ts
+    if description == "" and location == "":
+        gig.description = f"Gig ID {gig.id}"
+    session.add(gig)
+    session.commit()
+    gigs.append(gig)
+
+    singers = sorted([users_by_id[x] for x in singer_ids])
+    gig.update_singers(singers=singers)
+    return gig
+
+    #TODO delete all below, as that's now handled by update_singers
+
+
+    # set up setlist and possible assignments
+    singer_quals = select_quals(quals,user_ids=singer_ids,only_most_recent=True)
+    for qual in singer_quals:
+        expiry = QualExpirationData(qual,target_date=date_time)
+        part_assignment = GigSongVoicePartAssignment(
+                    gig_id=gig.id,
+                    user_id=qual.user_id,
+                    song_id=qual.song_id,
+                    part_id=qual.part_id)
+        part_assignment.date_time=qual.date_time
+        part_assignment.performance_ready = expiry.valid
+        part_assignment.sort_order = expiry.sort_order
+        if not expiry.valid:
+            part_assignment.sort_order += 1000
+        gig.assignments.append(part_assignment)
+    assignments = sorted(gig.assignments)
+
+    sorted_songs = sorted([(utility.qual_strength(singer_quals,s),s) for s in songs],reverse=True)
+    sort_order = 0
+    performable = True
+    for ((qual_strength,missing_parts),song) in sorted_songs:
+        sort_order += 1
+        if qual_strength < 0 and performable:
+            performable = False
+            setlist_item = GigSetListItem()
+            setlist_item.sort_order=sort_order
+            setlist_item.comments = "-- END SETLIST --"
+            gig.setlist.append(setlist_item)
+            sort_order += 100
+        if qual_strength < -1:
+            break
+        setlist_item = GigSetListItem()
+        setlist_item.gig_id = gig.id
+        setlist_item.song_id = song.id
+        setlist_item.duration = song.duration
+        setlist_item.song_key = song.performance_key if song.performance_key else song.written_key
+        setlist_item.sort_order = sort_order
+        gig.setlist.append(setlist_item)
+        if performable:
+            assign_parts(song,[a for a in assignments if a.song_id==song.id])
+
+    gig.singers = sorted([users_by_id[x] for x in singer_ids])
+
+    session.add(gig)
+    # TODO do we need to add the setlist and assignment itens?
+    session.commit()
+    gigs.append(gig)
+    return gig
 
 def reorder_tags(sorted_tag_list):
     for index,tag in enumerate(sorted_tag_list):
@@ -714,6 +1188,7 @@ songparts = []
 songs = []
 tags = []
 quals = []
+gigs = []
 songs_by_id = {}
 parts_by_id = {}
 users_by_id = {}
@@ -803,4 +1278,7 @@ def load_database():
     stmt = select(SongVoicePartQual)
     for qual in session.scalars(stmt):
         quals.append(qual)
+    stmt = select(Gig)
+    for gig in session.scalars(stmt):
+        gigs.append(gig)
 

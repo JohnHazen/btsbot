@@ -4,18 +4,18 @@ from slack_sdk.errors import SlackApiError
 
 from utility import select_quals,slack_user_id_from_context,command_words_from_context,authorized
 from utility import slack_ts_from_context,user_from_slack_id,qual_strength,normalize_slack_id
-from utility import song_qual_counts_by_part
+from utility import song_qual_counts_by_part,seconds_to_colon_separated,colon_separated_to_seconds
 import utility
 
 import functools
 import json
 import datetime
 
-from data_models import users,parts,songparts,songs,tags,quals
+from data_models import users,parts,songparts,songs,tags,quals,gigs
 from data_models import songs_by_id, parts_by_id, users_by_id, slack_name_from_db_name
 from data_models import slack_id_from_slack_name, user_id_from_slack_id,slack_id_from_user_id
 from data_models import create_qual, delete_qual, create_user, reorder_tags, delete_tag, tag_from_id
-from data_models import create_song
+from data_models import create_song, create_gig
 from data_models import QualExpirationData
 
 
@@ -94,18 +94,16 @@ def iter_commands(user=None,command_words=[],root=_root_command,path=[]):
 
 @log.logger.catch
 def handle_submit(context,client,say=None,respond=None):
-    # dispatch_table maps the callback_id to a submit func and a redraw (for the parent) func
-    dispatch_table = {
-            'manage_song_edit': (manage_song_edit_submit,update_manage_songs),
-            'admin_user_edit': (admin_user_edit_submit,None),
-        }
     if context['type'] != 'view_submission':
         log.slack.error(f"handle_submit called for non-form-submission.\n{context}")
         return False
     callback_id = context['view']['callback_id']
-    if callback_id not in dispatch_table:
-        log.slack.error(f"handle_submit called for unknown callback_id: {callback_id}")
+    submit_func_name = f"{callback_id}_submit"
+    submit_func = globals().get(submit_func_name,None)
+    if submit_func is None:
+        log.error(f"handle_submit: Submit Function '{submit_func_name}' not found.  Punt")
         return False
+
     # do common things here for all submits
     parent_view_id = context['view']['external_id']
     private_metadata = context['view']['private_metadata']
@@ -115,14 +113,24 @@ def handle_submit(context,client,say=None,respond=None):
     else:
         log.debug(f"handle_submit: private_metadata not specified.")
         channel_say = say
-    # now dispatch via callback_id
-    submit_func,redraw_func = dispatch_table[callback_id]
-    should_redraw = submit_func(context,client,say=channel_say,respond=respond)
-    if redraw_func is not None:
-        if should_redraw is None:
-            log.warning("submit_func for {callback_id} returned None.  Return True/False to indicate parent window redraw")
-        if should_redraw:
-            redraw_func(context,client,view_id=parent_view_id)
+
+    results = submit_func(context,client,say=channel_say,respond=respond)
+    if type(results) == dict:
+        redraw_func = results.get('redraw',None)
+        errors = results.get('errors',{})
+        kwargs = results.get('kwargs',{})
+        if errors:
+            return errors
+        # This may be required for others, but it's breaking gig_manage.
+        # should now pass on via kwargs are in result
+        if parent_view_id:
+            log.debug(f"parent_view_id is set, so inject: {parent_view_id}")
+            kwargs['view_id'] = parent_view_id
+        if redraw_func:
+            redraw_func(context,client,**kwargs)
+    else:
+        if results:
+            log.debug(f"handle_submit: results of submit func: {results}")
 
 @log.logger.catch
 def dispatch(context,client,say=None,respond=None):
@@ -367,6 +375,636 @@ def pre_details(arguments,context,client,say=None,respond=None,singer=None):
         lines.append([f"{exp.qual.date_time.strftime('%m/%d/%y')} {parts_by_id[exp.qual.part_id].name} {exp.emoji} {exp.status}","delete",delete])
     output_list_buttons(say,lines,f"Quals for {singer.name} for {songs_by_id[song_id].name}",context=context)
 
+def gig_manage_blocks(list_all=False):
+    blocks = []
+    if list_all:
+        display_gigs = sorted(gigs)
+    else:
+        display_gigs = [x for x in sorted(gigs) if x.active]
+    for gig in display_gigs:
+        blocks.extend(manage_blocks([(f"{gig.description} {gig.date_time.strftime('%m/%d/%y')}",
+            [('manage',f'manage gig {gig.id}')])]))
+    return blocks
+
+@command("manage",[])
+def manage_command(arguments,context,client,say=None,respond=None):
+    '''__no_help__
+       placeholder for manage subcommands, use for subcommand typo resolution
+    '''
+    log.debug(f"manage called with {arguments}") 
+    if len(arguments):
+        arg_string = " ".join(arguments)
+        return command_error(f"'manage {arg_string}' is not a valid command.  'help' for legal commands",context,client,say,respond)
+    return command_error(f"'manage' requires a sub-command.  'help' for legal commands",context,client,say,respond)
+
+@command("manage gigs",[])
+def gigs_manage(arguments,context,client,say=None,respond=None):
+    ''' Manage Gigs
+    '''
+    if "trigger_id" not in context:
+        # output button so we have a trigger, which is required by slack to do modals
+        output_list_buttons(say,
+                [[f"Slack requires that you press this button to manage gigs","manage gigs"]],
+                None,
+                context=context)
+        return
+    private_metadata = {}
+    private_metadata['channel_id'] = context['channel']['id']
+    private_metadata['thread_ts'] = context['container']['thread_ts']
+
+    blocks = gig_manage_blocks()
+
+    client.views_open(
+        # Pass a valid trigger_id within 3 seconds of receiving it
+        trigger_id=context["trigger_id"],
+        # View payload
+        view={
+            "type": "modal",
+            # View identifier
+            "callback_id": "manage gigs",
+            "title": {"type": "plain_text", "text": "Manage Gigs"},
+            #"submit": {"type": "plain_text", "text": "Submit"},
+            "private_metadata": json.dumps(private_metadata),
+            "blocks": blocks
+        }
+    )
+
+def part_assignment_select(song_id,part,assignments):
+    block = {
+			"type": "input",
+            "block_id": f"part_assignment_select_{song_id}_{part.id}",
+			"element": {
+				"type": "static_select",
+				"placeholder": {
+					"type": "plain_text",
+					"text": f"Select a {part.name}",
+					"emoji": True
+				},
+				"options": [],
+				"action_id": "song_part_select-action"
+			},
+			"label": {
+				"type": "plain_text",
+				"text": f"{part.name}",
+				"emoji": True
+			},
+			"optional": False
+		}
+    selected = None
+    for assignment in assignments:
+        singer_name = users_by_id[assignment.user_id].name
+        menu_text = f"{singer_name} {assignment.emoji()}"
+        menu_value = f"{assignment.id}"
+        #if selected is None and assignment.sort_order < 2:
+        if selected is None:
+            selected = (menu_text,menu_value)
+        block["element"]["options"].append(
+                {
+                    "text": {
+                        "type": "plain_text",
+                        "text": menu_text,
+                        "emoji": True
+                    },
+                    "value": menu_value
+                }
+            )
+    if selected is not None:
+        (menu_text,menu_value) = selected
+        block["element"]["initial_option"] = {
+                "text": {
+                    "type": "plain_text",
+                    "text": menu_text,
+                    "emoji": True
+                },
+                "value": menu_value
+            }
+    if len(assignments) == 0:
+        block["element"]["options"].append(
+                {
+                    "text": {
+                        "type": "plain_text",
+                        "text": "No qualified singers",
+                        "emoji": True
+                    },
+                    "value": "0"
+                }
+            )
+    return block
+
+def setlist_item_blocks(gig,item):
+    blocks = []
+    if item.song_id is not None:
+        # print song with control buttons, and lists for each part.
+        song = songs_by_id[item.song_id]
+        menu_list = []
+        accessory_list = []
+        # TODO dynamically assign options, because of limit of 5 from slack
+        for label,action in [
+                ("edit","edit"),
+                ("move up","sort_up"),
+                ("move down","sort_down"),
+                ("add to setlist","perform"),
+                ("remove from setlist","unperform"),
+                ("delete from this gig","delete"),
+                ]:
+            # TODO: add logic here to only have add/delete if in opposite state
+            if item.in_setlist and action == "perform":
+                continue
+            if not item.in_setlist and action == "unperform":
+                continue
+            accessory_list.append((f"{label}",f"manage setlist_item {action} {item.id}"))
+        # now add text for part assignments
+        part_text_list = []
+        for song_part in sorted(song.parts):
+            part = song_part.part
+            part_assignments = sorted([a for a in gig.assignments if a.part_id == part.id and a.song_id == item.song_id])
+            #blocks.append(part_assignment_select(item.song_id,part,part_assignments))
+            if len(part_assignments):
+                #part_text_list.append(f"{part.name}: " + "/".join([f"{users_by_id[a.user_id].name}{a.emoji()}({a.sort_order})" for a in part_assignments]))
+                assigned = part_assignments[0]
+                part_text_list.append(f"{users_by_id[assigned.user_id].name.split()[0]}{assigned.emoji()}")
+            else:
+                part_text_list.append(" ")
+            #print(f"{song.name}  {part}  {assignments}")
+        part_text = "/".join(part_text_list)
+        comment_text = f"\n{item.comments}" if item.comments else ""
+        menu_list.append((f"*{song.name}* {item.song_key} {seconds_to_colon_separated(item.duration)}{comment_text}\n{part_text}",accessory_list))
+        blocks.extend( manage_blocks(menu_list) )
+    else:
+        if item.comments == "-- END SETLIST --":
+            blocks.extend( manage_blocks([(f"*{item.comments}* duration: {seconds_to_colon_separated(gig.setlist_duration())} More setlist commands ---->",
+                [("add song",f"manage gig add_song {gig.id}")])]))
+        else:
+            #print comments along with reordering commands
+            blocks.extend( manage_blocks([(f"*{item.comments}* duration:{item.duration}",
+                [("delete",f"manage setlist_item delete {item.id}")])]))
+
+    return blocks
+
+
+def gig_blocks(gig):
+    blocks = [  
+            {
+                "type": "input",
+                "block_id": "gig_description",
+                "element": {
+                    "type": "plain_text_input",
+                    "initial_value": f"{gig.description}",
+                    "action_id": "edit_gig_description-action"
+                },
+                "label": {
+                    "type": "plain_text",
+                    "text": "Description",
+                    "emoji": True
+                },
+                "optional": False
+            },
+            {
+                "type": "input",
+                "block_id": "gig_location",
+                "element": {
+                    "type": "plain_text_input",
+                    "initial_value": f"{gig.location}",
+                    "action_id": "edit_gig_location-action"
+                },
+                "label": {
+                    "type": "plain_text",
+                    "text": "Location",
+                    "emoji": True
+                },
+                "optional": False
+            },
+            {
+                "type": "input",
+                "block_id": "gig_duration",
+                "element": {
+                    "type": "plain_text_input",
+                    "initial_value": f"{gig.duration}",
+                    "action_id": "edit_gig_duration-action"
+                },
+                "label": {
+                    "type": "plain_text",
+                    "text": "Desired Set Length (minutes)",
+                    "emoji": True
+                },
+                "optional": False
+            },
+            {
+                "type": "input",
+                "block_id": "gig_comments",
+                "element": {
+                    "type": "plain_text_input",
+                    "initial_value": f"{gig.comments}",
+                    "action_id": "edit_gig_comments-action"
+                },
+                "label": {
+                    "type": "plain_text",
+                    "text": "Comments",
+                    "emoji": True
+                },
+                "optional": False
+            },
+            {
+                "type": "input",
+                "block_id": "gig_datetimepicker",
+                "element": {
+                    "type": "datetimepicker",
+                    "initial_date_time": int(gig.date_time.timestamp()),
+                    "action_id": "datetimepicker-action"
+                },
+                "label": {
+                    "type": "plain_text",
+                    "text": "Time of Gig",
+                    "emoji": True
+                },
+                "optional": True
+            }
+        ]
+    blocks.append(multi_user_select_block(selected=gig.singers,label="Singers"))
+    for setlist_item in sorted(gig.setlist):
+        blocks.extend(setlist_item_blocks(gig,setlist_item))
+    return blocks
+
+def update_manage_gig(context,client,view_id=None,gig=None):
+    if gig is None:
+        log.warning(f"update_manage_gig called without kwargs that include 'gig' param.")
+        submit_title = context['view']['title']['text']
+        submit_title_id = int(submit_title.split()[-1])
+        # do something with this later if we have to.  For now, punt.
+        return
+    #log.debug(f"update_manage_gig: context:{context}")
+    blocks = gig_blocks(gig)
+    if view_id is None:
+        log.warning(f"update_manage_gig: view_id is none, so using current")
+        view_id = context['view']['id']
+    log.debug(f"update_manage_gig: view_id={view_id}")
+    client.views_update(
+        #trigger_id=context["trigger_id"],
+        view_id=view_id,
+        view={
+            "type": "modal",
+            # View identifier
+            "callback_id": "manage_gig",
+            "title": {"type": "plain_text", "text": f"Manage Gig id {gig.id}"},
+            "submit": {"type": "plain_text", "text": "Submit"},
+            #"private_metadata": json.dumps(private_metadata),
+            "blocks": blocks
+        }
+    )
+
+@command("manage gig",[])
+def manage_gig(arguments,context,client,say=None,respond=None):
+    '''__no_help__
+       Manage gig
+    '''
+    log.debug(f"manage_gig called with {arguments}") 
+    log.debug(f"manage_gig context {context}") 
+    log.debug(f"manage_gig trigger_id {context['trigger_id']}") 
+    if "trigger_id" not in context:
+        # output button so we have a trigger, which is required by slack to do modals
+        output_list_buttons(say,
+                [[f"Slack requires that you press this button to manage the gig",f"manage gig {' '.join(arguments)}"]],
+                None,
+                context=context)
+        return
+    log.trace(f"gigs = {gigs}") 
+    gig_id = int(arguments[0])
+    gig_list = [x for x in gigs if x.id == gig_id]
+    if len(gig_list) != 1:
+        log.error(f"Problem finding gig from id {gig_id}.  Found {gig_list}")
+    gig = gig_list[0]
+    blocks = gig_blocks(gig)
+    #blocks.append(difficulty_select(selected=song.difficulty))
+    #blocks.append(tag_select_block(song.tags))
+    #log.debug(f"manage_gig: blocks={blocks}")
+    view={
+        "type": "modal",
+        "notify_on_close": True,
+        "callback_id": "manage_gig",
+        "title": {"type": "plain_text", "text": f"Manage Gig id {gig.id}"},
+        "submit": {"type": "plain_text", "text": "Submit"},
+        #"private_metadata": json.dumps(private_metadata),
+        "blocks": blocks
+    }
+    if 'view' in context:
+        # came from a parent window
+        view['external_id'] = context['view']['id']
+        modal_open_func = client.views_push
+    else:
+        # direct from button
+        modal_open_func = client.views_open
+    modal_open_func(
+        trigger_id=context["trigger_id"],
+        view_id="manage_gig",
+        view=view
+    )
+
+def manage_gig_submit(context,client,say=None,respond=None):
+    #log.debug(f"context: {context}")
+    values = context['view']['state']['values']
+    log.debug(f"values: {values}")
+    gig_id = int(context['view']['title']['text'].split()[-1])
+    gig = [g for g in gigs if g.id == gig_id][0]
+
+    description = values['gig_description']['edit_gig_description-action']['value']
+    location = values['gig_location']['edit_gig_location-action']['value']
+    duration = int(values['gig_duration']['edit_gig_duration-action']['value'])
+    comments = values['gig_comments']['edit_gig_comments-action']['value']
+    date_time_timestamp = values['gig_datetimepicker']['datetimepicker-action']['selected_date_time']
+    date_time = datetime.datetime.fromtimestamp(date_time_timestamp)
+    selected_user_slack_ids = values['multi_users_select']['multi_users_select-action']['selected_users']
+    singer_ids = [user_id_from_slack_id[x] for x in selected_user_slack_ids]
+    singers = [users_by_id[x] for x in singer_ids]
+    gig.update(description=description,location=location,duration=duration,
+            comments=comments,date_time=date_time,singers=singers)
+
+    return {'redraw': update_manage_gig, 'kwargs': {'gig': gig}}
+
+
+    selected = dict()
+    for key,value in values.items():
+        if key.startswith("part_assignment_select"):
+            key_parts = key.split("_")
+            song_id = int(key_parts[-2])
+            part_id = int(key_parts[-1])
+            selected_id = int(values[key]['song_part_select-action']['selected_option']['value'])
+            selected[part_id] = selected_id
+        else:
+            log.debug(f"unhandled value from part_select_submit {key}")
+    # error checking
+    selected_user_ids = set()
+    errors = {}
+    for part_id,selected_id in selected.items():
+        assignment = [a for a in gig.assignments if a.id == selected_id][0]
+        if assignment.user_id in selected_user_ids:
+            block_id = f"part_assignment_select_{song_id}_{part_id}"
+            errors[block_id] = "Can't assign same person to multiple parts."
+        else:
+            selected_user_ids.add(assignment.user_id)
+    if errors:
+        return {'errors':errors}
+
+    song = songs_by_id[song_id]
+    for part in sorted(song.parts):
+        selected_id = selected[part.part.id]
+        part_assignments = sorted([a for a in gig.assignments if a.part_id == part.part.id and a.song_id == song.id])
+        if part_assignments[0].id != selected_id:
+            # selection changed, so reorder
+            for index,assignment in enumerate(part_assignments):
+                if assignment.id != selected_id:
+                    if assignment.sort_order < index+1:
+                        assignment.update(sort_order=index+1)
+                else:
+                    assignment.update(sort_order=0)
+
+    return {'redraw': update_manage_gig, 'kwargs': {'gig': gig}}
+
+def gig_setlist_item_edit_dialog(gig,item,context,client):
+    blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"Edit setlist item",
+                    "emoji": True
+                }
+            },
+            {
+                "type": "input",
+                "block_id": "comments",
+                "element": {
+                    "type": "plain_text_input",
+                    "initial_value": f"{item.comments}",
+                    "action_id": "setlist_item_edit-action"
+                },
+                "label": {
+                    "type": "plain_text",
+                    "text": "Comments",
+                    "emoji": True
+                },
+                "optional": False
+            },
+            {
+                "type": "input",
+                "block_id": "duration",
+                "element": {
+                    "type": "plain_text_input",
+                    "initial_value": f"{seconds_to_colon_separated(item.duration)}",
+                    "action_id": "setlist_item_edit-action"
+                },
+                "label": {
+                    "type": "plain_text",
+                    "text": "Comments",
+                    "emoji": True
+                },
+                "optional": False
+            },
+        ]
+    if item.song_id:
+        song = songs_by_id[item.song_id]
+        blocks[0]["text"]["text"] = f"Edit setlist entry for {song.name}"
+        # don't normally need comments for song
+        blocks[1]["optional"] = True
+        blocks.append(
+                {
+                    "type": "input",
+                    "block_id": "song_key",
+                    "element": {
+                        "type": "plain_text_input",
+                        "initial_value": f"{item.song_key}",
+                        "action_id": "setlist_item_edit-action"
+                    },
+                    "label": {
+                        "type": "plain_text",
+                        "text": "Key",
+                        "emoji": True
+                    },
+                    "optional": False
+                },
+            )
+        for part in sorted(song.parts):
+            part_assignments = sorted([a for a in gig.assignments if a.part_id == part.part.id and a.song_id == item.song_id])
+            blocks.append(part_assignment_select(item.song_id,part.part,part_assignments))
+    log.debug(f"gig_song_part_assign: blocks={blocks}")
+    client.views_push(
+        trigger_id=context["trigger_id"],
+        view_id="manage_setlist_item_edit",
+        # View payload
+        view={
+            "type": "modal",
+            "external_id": context['view']['id'],
+            "notify_on_close": True,
+            "callback_id": "setlist_item_edit",
+            "title": {"type": "plain_text", "text": f"Edit Setlist Item {item.id}"},
+            "submit": {"type": "plain_text", "text": "Submit"},
+            #"private_metadata": json.dumps(private_metadata),
+            "blocks": blocks
+        }
+    )
+
+def setlist_item_edit_submit(context,client,say=None,respond=None):
+    #log.debug(f"context: {context}")
+    values = context['view']['state']['values']
+    log.debug(f"values: {values}")
+    item_id = int(context['view']['title']['text'].split()[-1])
+    gig = [g for g in gigs if item_id in [si.id for si in g.setlist]][0]
+    item = [i for i in gig.setlist if i.id == item_id][0]
+    comments = values['comments']['setlist_item_edit-action']['value']
+    duration = colon_separated_to_seconds(values['duration']['setlist_item_edit-action']['value'])
+    if item.song_id:
+        song_key = values['song_key']['setlist_item_edit-action']['value']
+    item.update(comments=comments,song_key=song_key,duration=duration)
+    if item.song_id:
+        selected = dict()
+        for key,value in values.items():
+            if key.startswith("part_assignment_select"):
+                key_parts = key.split("_")
+                song_id = int(key_parts[-2])
+                part_id = int(key_parts[-1])
+                selected_id = int(values[key]['song_part_select-action']['selected_option']['value'])
+                selected[part_id] = selected_id
+            else:
+                log.debug(f"unhandled value from part_select_submit {key}")
+        # error checking
+        selected_user_ids = set()
+        errors = {}
+        for part_id,selected_id in selected.items():
+            assignment = [a for a in gig.assignments if a.id == selected_id][0]
+            if assignment.user_id in selected_user_ids:
+                block_id = f"part_assignment_select_{song_id}_{part_id}"
+                errors[block_id] = "Can't assign same person to multiple parts."
+            else:
+                selected_user_ids.add(assignment.user_id)
+        if errors:
+            return {'errors':errors}
+
+        song = songs_by_id[song_id]
+        for part in sorted(song.parts):
+            selected_id = selected[part.part.id]
+            part_assignments = sorted([a for a in gig.assignments if a.part_id == part.part.id and a.song_id == song.id])
+            if part_assignments[0].id != selected_id:
+                # selection changed, so reorder
+                for index,assignment in enumerate(part_assignments):
+                    if assignment.id != selected_id:
+                        if assignment.sort_order < index+1:
+                            assignment.update(sort_order=index+1)
+                    else:
+                        assignment.update(sort_order=0)
+
+    # TODO - zzz  make sure gig view updates properly
+    return {'redraw': update_manage_gig, 'kwargs': {'gig': gig}}
+
+@command("manage gig add_song",[])
+def manage_gig_add_song(arguments,context,client,say=None,respond=None):
+    '''__no_help__
+       Add song to setlist of gig
+    '''
+    log.debug(f"manage_gig_add_song called with {arguments}") 
+    #log.trace(f"gigs = {gigs}") 
+    gig_id = int(arguments[0])
+    gig_list = [x for x in gigs if x.id == gig_id]
+    if len(gig_list) != 1:
+        log.error(f"Problem finding gig from id {gig_id}.  Found {gig_list}")
+    gig = gig_list[0]
+    blocks = [ song_select_menu([]) ]
+
+    #log.debug(f"blocks={blocks}")
+    client.views_push(
+        trigger_id=context["trigger_id"],
+        view_id="manage_gig_add_song",
+        # View payload
+        view={
+            "type": "modal",
+            "external_id": context['view']['id'],
+            "notify_on_close": True,
+            "callback_id": "manage_gig_add_song",
+            "title": {"type": "plain_text", "text": f"Add Song to Gig {gig.id}"},
+            "submit": {"type": "plain_text", "text": "Submit"},
+            #"private_metadata": json.dumps(private_metadata),
+            "blocks": blocks
+        }
+    )
+
+def manage_gig_add_song_submit(context,client,say=None,respond=None):
+    #log.debug(f"context: {context}")
+    values = context['view']['state']['values']
+    log.debug(f"values: {values}")
+    gig_id = int(context['view']['title']['text'].split()[-1])
+    gig = [g for g in gigs if g.id == gig_id][0]
+    song_id = int(values['songs_select']['song_selected']['selected_option']['value'])
+    gig.add_setlist_item(song_id=song_id)
+    return {'redraw': update_manage_gig, 'kwargs': {'gig': gig}}
+
+@command("manage setlist_item",[])
+def manage_setlist_item(arguments,context,client,say=None,respond=None):
+    '''__no_help__
+       Manage Setlist Item
+    '''
+    log.debug(f"manage_setlist_item called with {arguments}") 
+    item_id = int(arguments[1])
+    gig = [g for g in gigs if item_id in [si.id for si in g.setlist]][0]
+    item = [i for i in gig.setlist if i.id == item_id][0]
+    end_setlist_item = [i for i in gig.setlist if i.comments == '-- END SETLIST --'][0]
+    setlist = sorted(gig.setlist)
+
+    if arguments[0] == "edit":
+        gig_setlist_item_edit_dialog(gig,item,context,client)
+        return
+    elif arguments[0] == "delete":
+        gig.delete_setlist_item(item)
+        update_manage_gig(context,client,gig=gig)
+        return
+    elif arguments[0] in ['sort_up','sort_down']:
+        insert_point = setlist.index(item)
+        offset = 1 if arguments[0] == 'sort_down' else -1
+    elif arguments[0] in ['perform','unperform']:
+        insert_point = setlist.index(end_setlist_item)
+        offset = 0 if arguments[0] == 'unperform' else 0
+        in_setlist = False if arguments[0] == 'unperform' else True
+        item.update(in_setlist=in_setlist)
+    else:
+        log.error(f"manage_setlist_item unexpected subcommand: {arguments}")
+        return
+
+    # continue logic for sort and perform ops
+    log.debug(f"setlist re-sort.  insert_point={insert_point}, offset={offset}  setlist={setlist}")
+    setlist.remove(item)
+    setlist.insert(insert_point+offset,item)
+    log.debug(f"setlist after re-sort.  setlist={setlist}")
+    #gig.setlist=setlist
+    for index,item in enumerate(setlist):
+        if item.sort_order != index:
+            item.update(sort_order=index)
+    update_manage_gig(context,client,gig=gig)
+    #zzz
+    return
+
+    gig_id = int(arguments[0])
+    gig_list = [x for x in gigs if x.id == gig_id]
+    if len(gig_list) != 1:
+        log.error(f"Problem finding gig from id {gig_id}.  Found {gig_list}")
+    gig = gig_list[0]
+    blocks = gig_blocks(gig)
+    #blocks.append(difficulty_select(selected=song.difficulty))
+    #blocks.append(tag_select_block(song.tags))
+    #log.debug(f"manage_gig: blocks={blocks}")
+    client.views_push(
+        trigger_id=context["trigger_id"],
+        view_id="manage_gig",
+        # View payload
+        view={
+            "type": "modal",
+            "external_id": context['view']['id'],
+            "notify_on_close": True,
+            "callback_id": "manage_gig",
+            "title": {"type": "plain_text", "text": f"Manage Gig id {gig.id}"},
+            "submit": {"type": "plain_text", "text": "Submit"},
+            #"private_metadata": json.dumps(private_metadata),
+            "blocks": blocks
+        }
+    )
+
+
 @command("gig",[])
 def gig_songs(arguments,context,client,say=None,respond=None):
     ''' "gig @singer @singer ..."  show which songs can be performed by the performers
@@ -426,12 +1064,58 @@ def gig_songs(arguments,context,client,say=None,respond=None):
 
     output_list_buttons(say,[[x,''] for x in lines],f"gig songs for {arguments}:",context=context)
 
+@command("gig add",[])
+def gig_add(arguments,context,client,say=None,respond=None):
+    ''' "gigs add @singer @singer ..."  create new gig item for a gig with 
+        specific singers.
+        You can specify more than four singers.
+    '''
+    ids = []
+    description_words = []
+    for arg in arguments:
+        id = user_from_slack_id(arg)
+        if id is not None:
+            ids.append(id)
+        else:
+            description_words.append(arg)
+    if description_words:
+        description = " ".join(description_words)
+    else:
+        description = ""
+
+    #TODO capture thread_ts if message is in the #gigs channel
+    gig = create_gig(ids,description=description)
+
+    #TODO go straight from create to manage that gig.
+
 @command("admin",['admin'])
 def admin(arguments,context,client,say=None,respond=None):
     '''__no_help__
         misc admin actions.  Not used yet.
     '''
     pass
+
+@command("admin song_auto_part_sort_order",['admin'])
+def auto_song_part_sort_order(arguments,context,client,say=None,respond=None):
+    ''' impose order on the chaos of default sorting in song parts.  Sort Tenor<Lead<Bari<Bass
+    '''
+    part_sort_order = { 
+            "Tenor" : 1,
+            "Lead" : 2,
+            "Bari" : 3,
+            "Bass" : 4,
+            }
+    for song in songs:
+        for part in song.parts:
+            if part.part.name in part_sort_order:
+                part.update(sort_order=part_sort_order[part.part.name])
+            else:
+                log.warning(f"song {song.name} has non-standard part {part.part.namd} skipped in auto_sort_order.")
+        if song.duration is None:
+            song.duration = 120
+        if song.written_key is None:
+            song.written_key = "Bb"
+
 
 @command("admin user",['admin'])
 def admin_user(arguments,context,client,say=None,respond=None):
@@ -466,6 +1150,7 @@ def admin_user(arguments,context,client,say=None,respond=None):
             return command_error(f"Error getting real name of user {slack_display_id}!  Please let an admin know.",
                     context,client,say,respond)
         #do add operation (call datamodels func)
+        log.debug(f"response: {response}")
         create_user(name,slack_user_id)
         msg = f"{slack_display_id} added to the database.  Click this button to edit."
         user_id = user_from_slack_id(slack_user_id)
@@ -680,17 +1365,6 @@ def pre_interact(arguments,context,client,say=None,respond=None):
         }
     )
 
-@command("manage",[])
-def manage_command(arguments,context,client,say=None,respond=None):
-    '''__no_help__
-       placeholder for manage subcommands, use for subcommand typo resolution
-    '''
-    log.debug(f"manage called with {arguments}") 
-    if len(arguments):
-        arg_string = " ".join(arguments)
-        return command_error(f"'manage {arg_string}' is not a valid command.  'help' for legal commands",context,client,say,respond)
-    return command_error(f"'manage' requires a sub-command.  'help' for legal commands",context,client,say,respond)
-
 def manage_blocks(text_menu_list):
     ''' text_menu_list is a list of 2-tuples: mrkdown_text,[overflow_data]
         overflow_data is also a list of 2-tuples: label,value    value is dispatched as a command
@@ -760,7 +1434,7 @@ def update_manage_songs(context,client,view_id=None):
         view={
             "type": "modal",
             # View identifier
-            "callback_id": "manage tags interact",
+            "callback_id": "manage songs interact",
             "title": {"type": "plain_text", "text": "Manage Song Tags"},
             #"submit": {"type": "plain_text", "text": "Submit"},
             #"private_metadata": json.dumps(private_metadata),
@@ -937,6 +1611,29 @@ def auth_checkboxes_block(selected_auths):
     log.debug(f"block={block}")
     return block
 
+def multi_user_select_block(selected=[],label="Users"):
+    block = {
+			"type": "input",
+            "block_id": "multi_users_select",
+            "label": {
+                "type": "plain_text",
+                "text": label,
+                "emoji": True,
+                },
+            "optional": False,
+			"element": {
+                "type": "multi_users_select",
+                "placeholder": {
+                    "type": "plain_text",
+                    "text": f"select {label}",
+                    },
+                "action_id": "multi_users_select-action"
+            }
+		}
+    if selected:
+        block["element"]["initial_users"] = [f"{x.slack_id}" for x in selected]
+    return block
+
 def datepicker_block(date=datetime.date.today()):
     block = {
             "type": "input",
@@ -970,7 +1667,8 @@ def manage_song(arguments,context,client,say=None,respond=None):
         #song_lines = '\n'.join(s.name for s in target_tag.songs)
         part_counters = song_qual_counts_by_part(song,quals)
         log.debug(f"part_counters: {part_counters}")
-        blocks = [{
+        blocks = [
+                    {
                         "type": "input",
                         "block_id": "song_name",
                         "element": {
@@ -984,8 +1682,55 @@ def manage_song(arguments,context,client,say=None,respond=None):
                             "emoji": True
                         },
                         "optional": False
-                    }
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "song_written_key",
+                        "element": {
+                            "type": "plain_text_input",
+                            "initial_value": f"{song.written_key}",
+                            "action_id": "edit_song-action"
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "Notated Key",
+                            "emoji": True
+                        },
+                        "optional": False
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "song_performance_key",
+                        "element": {
+                            "type": "plain_text_input",
+                            "initial_value": f"{song.performance_key}",
+                            "action_id": "edit_song-action"
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "Performance Key",
+                            "emoji": True
+                        },
+                        "optional": True
+                    },
+                    {
+                        "type": "input",
+                        "block_id": "song_duration",
+                        "element": {
+                            "type": "plain_text_input",
+                            "initial_value": f"{seconds_to_colon_separated(song.duration)}",
+                            "action_id": "edit_song-action"
+                        },
+                        "label": {
+                            "type": "plain_text",
+                            "text": "Duration",
+                            "emoji": True
+                        },
+                        "optional": False
+                    },
                 ]
+        if song.performance_key is None:
+            blocks[2]["element"].pop("initial_value")
         blocks.append(difficulty_select(selected=song.difficulty))
         blocks.append(tag_select_block(song.tags))
         log.debug(f"manage_song: blocks={blocks}")
@@ -1005,28 +1750,17 @@ def manage_song(arguments,context,client,say=None,respond=None):
                 "blocks": blocks
             }
         )
-        ### stuff below here is from tags, should delete or convert to song
-        # zzz
-    elif arguments[0] == 'delete':
-        # for song delete, we want to check just mark it deleted
-        # TODO add "deleted" flag to song table
-        target_tag_id = int(arguments[1])
-        for tag in tags:
-            if tag.id == target_tag_id:
-                target_tag = tag
-                break
-        if len(target_tag.songs):
-            log.slack.error(f"Error:  Can't delete song tag that has songs assigned to it. {target_tag.name}")
-        else:
-            delete_tag(target_tag)
-            # repaint modal with updated sorting
-            update_tag_manage_view(context,client)
     else:
         command_error(f"'manage_song' got unsupported args {arguments}",context,client,say,respond)
 
 def manage_song_edit_submit(context,client,say=None,respond=None):
     log.debug(f"values: {context['view']['state']['values']}")
     name = context['view']['state']['values']['song_name']['edit_song-action']['value']
+    written_key = context['view']['state']['values']['song_written_key']['edit_song-action']['value']
+    performance_key = context['view']['state']['values']['song_performance_key']['edit_song-action']['value']
+    if not performance_key or performance_key == "None":
+        performance_key = None
+    duration = colon_separated_to_seconds(context['view']['state']['values']['song_duration']['edit_song-action']['value'])
     song_id = int(context['view']['title']['text'].split()[-1])
     song = songs_by_id[song_id]
     song_db_tag_ids = [x.id for x in song.tags]
@@ -1037,8 +1771,9 @@ def manage_song_edit_submit(context,client,say=None,respond=None):
     tag_ids = [ int(x['value']) for x in selected_categories ]
     target_tags = [tag_from_id(x) for x in tag_ids]
     log.debug(f"tag_ids: {tag_ids}")
-    song.update(name=name,difficulty=difficulty,tags=target_tags)
-    return True # this refreshes parent view
+    song.update(name=name,difficulty=difficulty,written_key=written_key,performance_key=performance_key,
+            duration=duration,tags=target_tags)
+    return {'redraw': update_manage_songs }
 
 def admin_user_edit_submit(context,client,say=None,respond=None):
     values = context['view']['state']['values']
@@ -1050,7 +1785,7 @@ def admin_user_edit_submit(context,client,say=None,respond=None):
     auths = [ x['value'] for x in selected_checkboxes ]
     log.debug(f"user_id: {user.id}  old_name:{user.name} new_name: {name} auths: {auths}")
     user.update(name=name,auth_list=auths)
-    return False # this says do not refresh parent view
+    return {} # this says do not refresh parent view
 
 
 def tag_manage_blocks():
@@ -1313,6 +2048,13 @@ def hint_sorted_songs(hints):
         relevance is based on the 'hints' list.  Hints can be words in the title,
             song tags, (in the future, other metadata songs may have)
     '''
+    def relevance_alpha_sort(x,y):
+        if x[0] > y[0]: # relevance
+            return 1
+        if x[0] < y[0]: # relevance
+            return -1
+        return 1 if x[1].name > y[1].name else -1 # alpha on song name
+        
     lower_hints = [ x.lower() for x in hints ]
     if hints:
         hint_count = float(len(hints))
@@ -1328,7 +2070,7 @@ def hint_sorted_songs(hints):
             if hint in song_tags:
                 relevance += 1
         tuples.append((relevance/hint_count,song))
-    tuples.sort(reverse=True)
+    tuples.sort(key=functools.cmp_to_key(relevance_alpha_sort))
     return tuples
 
 

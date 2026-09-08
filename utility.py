@@ -199,15 +199,39 @@ def song_qual_counts_by_part(song,quals):
 
     return qual_counters
 
-
-
-
-
-
-
-
-
-
+def assign_parts(song, remaining, assigned=[]):
+    '''
+    assign parts to a setlist_song.  When a part is assigned by a human, it gets sort_order=0.
+        when assigned via algorithm, it's assigned sort_order=1.
+    '''
+    log.debug(f"assign_parts Enter: {song.name} assigned:{assigned} remaining:{len(remaining)}")
+    remaining = list(remaining)
+    while len(remaining):
+        new_assignment = remaining.pop(0)
+        if len([x for x in assigned if x.part_id==new_assignment.part_id]):
+            # skip if earlier sort_order assignment alread on that part
+            if new_assignment.sort_order == 0:
+                log.warn(f"multiple assignments with sort_order=0 for {song.name} part_id {new_assignment.part_id}")
+            log.debug(f"adding assignment for {new_assignment.part_id} {new_assignment.user_id}")
+            continue
+        #so add it.
+        new_assigned = list(assigned)
+        if new_assignment.sort_order < 2000:
+            # don't autoassign non-qual entries
+            new_assigned.append(new_assignment)
+        # TODO eventually use actual parts of song, not just 4
+        if len(new_assigned) == 4:
+            # full quartet!  assign and return
+            log.debug(f"Found Quartet: {new_assigned}")
+            for assignment in new_assigned:
+                if assignment.sort_order > 1:
+                    assignment.update(sort_order=1)
+            return True
+        # remove newly added singer from remaining assignments for other parts
+        if assign_parts(song,[x for x in remaining if x.user_id != new_assignment.user_id],new_assigned):
+            return True
+    # reached end of list without assigning
+    return False
 
 def song_permutations(qual_list,parts_to_fill,debug=False):
     '''
@@ -619,3 +643,25 @@ def name_key(x):
 
 def sorted_by_name(list_to_be_sorted):
     return sorted(list_to_be_sorted,key=name_key)
+
+def seconds_to_colon_separated(duration):
+    hours = duration // 3600
+    seconds_remaining = duration % 3600
+    minutes = seconds_remaining // 60
+    seconds = seconds_remaining % 60
+    string_bits = []
+    if not(minutes or hours):
+        return f"{seconds}"
+    if not hours:
+        return f"{minutes}:{seconds:02}"
+    return f"{hours}:{minutes:02}:{seconds:02}"
+
+def colon_separated_to_seconds(duration_string):
+    parts = duration_string.split(":")
+    total = 0
+    while parts:
+        total *= 60
+        total += int(parts.pop(0))
+    return total
+
+
