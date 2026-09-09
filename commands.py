@@ -794,7 +794,7 @@ def gig_setlist_item_edit_dialog(gig,item,context,client):
                 },
                 "label": {
                     "type": "plain_text",
-                    "text": "Comments",
+                    "text": "Duration",
                     "emoji": True
                 },
                 "optional": False

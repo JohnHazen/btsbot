@@ -645,6 +645,8 @@ def sorted_by_name(list_to_be_sorted):
     return sorted(list_to_be_sorted,key=name_key)
 
 def seconds_to_colon_separated(duration):
+    if duration is None:
+        duration = 0
     hours = duration // 3600
     seconds_remaining = duration % 3600
     minutes = seconds_remaining // 60
