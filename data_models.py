@@ -416,7 +416,7 @@ class Gig(Base):
                         self.assignments.append(part_assignment)
 
             log.debug(f"assigning parts for {song.name}")
-            assign_parts(song,[a for a in self.assignments if a.song_id==song.id])
+            assign_parts(song,[a for a in self.assignments if a.song_id==song.id and a.performance_ready])
 
 
         self.setlist.insert(insert_point,item)
@@ -561,7 +561,7 @@ class Gig(Base):
             # auto-assign new songs
             if setlist_item in new_setlist_items or not in_setlist:
                 log.debug(f"assigning parts for {song.name}")
-                assign_parts(song,[a for a in self.assignments if a.song_id==song.id])
+                assign_parts(song,[a for a in self.assignments if a.song_id==song.id and a.performance_ready])
 
         session.add(self)
         session.commit()
@@ -954,7 +954,7 @@ def create_gig(singer_ids,date_time=None,location="",description="",thread_ts=""
         setlist_item.sort_order = sort_order
         gig.setlist.append(setlist_item)
         if performable:
-            assign_parts(song,[a for a in assignments if a.song_id==song.id])
+            assign_parts(song,[a for a in self.assignments if a.song_id==song.id and a.performance_ready])
 
     gig.singers = sorted([users_by_id[x] for x in singer_ids])
 

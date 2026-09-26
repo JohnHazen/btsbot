@@ -205,6 +205,9 @@ def assign_parts(song, remaining, assigned=[]):
         when assigned via algorithm, it's assigned sort_order=1.
     '''
     log.debug(f"assign_parts Enter: {song.name} assigned:{assigned} remaining:{len(remaining)}")
+    if len(remaining) > 25:
+        #punt auto-assign for large gigs
+        return False
     remaining = list(remaining)
     while len(remaining):
         new_assignment = remaining.pop(0)

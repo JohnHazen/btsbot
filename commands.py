@@ -659,7 +659,6 @@ def manage_gig(arguments,context,client,say=None,respond=None):
     '''
     log.debug(f"manage_gig called with {arguments}") 
     log.debug(f"manage_gig context {context}") 
-    log.debug(f"manage_gig trigger_id {context['trigger_id']}") 
     if "trigger_id" not in context:
         # output button so we have a trigger, which is required by slack to do modals
         output_list_buttons(say,
@@ -667,6 +666,7 @@ def manage_gig(arguments,context,client,say=None,respond=None):
                 None,
                 context=context)
         return
+    log.debug(f"manage_gig trigger_id {context['trigger_id']}") 
     log.trace(f"gigs = {gigs}") 
     gig_id = int(arguments[0])
     gig_list = [x for x in gigs if x.id == gig_id]
@@ -760,6 +760,9 @@ def manage_gig_submit(context,client,say=None,respond=None):
     return {'redraw': update_manage_gig, 'kwargs': {'gig': gig}}
 
 def gig_setlist_item_edit_dialog(gig,item,context,client):
+    comments_value = item.comments
+    if comments_value in [None,""," "]:
+        comments_value = ""
     blocks = [
             {
                 "type": "section",
@@ -774,7 +777,7 @@ def gig_setlist_item_edit_dialog(gig,item,context,client):
                 "block_id": "comments",
                 "element": {
                     "type": "plain_text_input",
-                    "initial_value": f"{item.comments}",
+                    "initial_value": comments_value,
                     "action_id": "setlist_item_edit-action"
                 },
                 "label": {
@@ -853,6 +856,8 @@ def setlist_item_edit_submit(context,client,say=None,respond=None):
     duration = colon_separated_to_seconds(values['duration']['setlist_item_edit-action']['value'])
     if item.song_id:
         song_key = values['song_key']['setlist_item_edit-action']['value']
+    if not item.comments or item.comments in ["None",None]:
+        comments = ""
     item.update(comments=comments,song_key=song_key,duration=duration)
     if item.song_id:
         selected = dict()
@@ -863,8 +868,6 @@ def setlist_item_edit_submit(context,client,say=None,respond=None):
                 part_id = int(key_parts[-1])
                 selected_id = int(values[key]['song_part_select-action']['selected_option']['value'])
                 selected[part_id] = selected_id
-            else:
-                log.debug(f"unhandled value from part_select_submit {key}")
         # error checking
         selected_user_ids = set()
         errors = {}
@@ -876,7 +879,10 @@ def setlist_item_edit_submit(context,client,say=None,respond=None):
             else:
                 selected_user_ids.add(assignment.user_id)
         if errors:
-            return {'errors':errors}
+            if len(gig.singers) < 6:
+                return {'errors':errors}
+            else:
+                log.warning(f"submit errors, but ignoring because gig planning.  errors={errors}")
 
         song = songs_by_id[song_id]
         for part in sorted(song.parts):
@@ -1424,6 +1430,7 @@ def song_by_tag_manage_blocks(alpha_sort=False):
 
 def update_manage_songs(context,client,view_id=None):
     blocks = song_by_tag_manage_blocks()
+    blocks.extend(manage_blocks([(f"Other Actions",[("Create New Song","manage song create_new")])]))
     if view_id is None:
         log.warning(f"update_manage_songs: view_id is none, so using current")
         view_id = context['view']['id']
@@ -1435,7 +1442,7 @@ def update_manage_songs(context,client,view_id=None):
             "type": "modal",
             # View identifier
             "callback_id": "manage songs interact",
-            "title": {"type": "plain_text", "text": "Manage Song Tags"},
+            "title": {"type": "plain_text", "text": "Manage Songs"},
             #"submit": {"type": "plain_text", "text": "Submit"},
             #"private_metadata": json.dumps(private_metadata),
             "blocks": blocks
@@ -1571,7 +1578,7 @@ def tag_select_block(selected_tags=[]):
 		}
     if selected_tags:
         block["element"]["initial_options"] = [tag_select_option(t) for t in sorted(selected_tags)]
-    block["element"]["options"] = [tag_select_option(t) for t in sorted(tags)][:10]
+    block["element"]["options"] = [tag_select_option(t) for t in sorted(tags)]
     return block
 
 def tag_checkboxes_block(selected_tags=[]):
