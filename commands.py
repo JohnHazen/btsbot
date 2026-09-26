@@ -375,12 +375,14 @@ def pre_details(arguments,context,client,say=None,respond=None,singer=None):
         lines.append([f"{exp.qual.date_time.strftime('%m/%d/%y')} {parts_by_id[exp.qual.part_id].name} {exp.emoji} {exp.status}","delete",delete])
     output_list_buttons(say,lines,f"Quals for {singer.name} for {songs_by_id[song_id].name}",context=context)
 
-def gig_manage_blocks(list_all=False):
+def gig_manage_blocks(show_all=False):
+    #TODO probably should do a "show since <date>" and a "show older" button?
+    show_date = datetime.datetime.now() - datetime.timedelta(days=10)
     blocks = []
-    if list_all:
+    if show_all:
         display_gigs = sorted(gigs)
     else:
-        display_gigs = [x for x in sorted(gigs) if x.active]
+        display_gigs = [x for x in sorted(gigs) if x.active and x.date_time > show_date]
     for gig in display_gigs:
         blocks.extend(manage_blocks([(f"{gig.description} {gig.date_time.strftime('%m/%d/%y')}",
             [('manage',f'manage gig {gig.id}')])]))
@@ -401,10 +403,16 @@ def manage_command(arguments,context,client,say=None,respond=None):
 def gigs_manage(arguments,context,client,say=None,respond=None):
     ''' Manage Gigs
     '''
+    if "all" in arguments:
+        show_all = True
+        button_all_text = " all"
+    else:
+        show_all = False
+        button_all_text = ""
     if "trigger_id" not in context:
         # output button so we have a trigger, which is required by slack to do modals
         output_list_buttons(say,
-                [[f"Slack requires that you press this button to manage gigs","manage gigs"]],
+                [[f"Slack requires that you press this button to manage gigs",f"manage gigs{button_all_text}"]],
                 None,
                 context=context)
         return
@@ -412,7 +420,7 @@ def gigs_manage(arguments,context,client,say=None,respond=None):
     private_metadata['channel_id'] = context['channel']['id']
     private_metadata['thread_ts'] = context['container']['thread_ts']
 
-    blocks = gig_manage_blocks()
+    blocks = gig_manage_blocks(show_all=show_all)
 
     client.views_open(
         # Pass a valid trigger_id within 3 seconds of receiving it
@@ -856,7 +864,7 @@ def setlist_item_edit_submit(context,client,say=None,respond=None):
     duration = colon_separated_to_seconds(values['duration']['setlist_item_edit-action']['value'])
     if item.song_id:
         song_key = values['song_key']['setlist_item_edit-action']['value']
-    if not item.comments or item.comments in ["None",None]:
+    if not comments or comments in ["None",None]:
         comments = ""
     item.update(comments=comments,song_key=song_key,duration=duration)
     if item.song_id:
